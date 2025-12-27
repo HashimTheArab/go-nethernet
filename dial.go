@@ -317,7 +317,10 @@ type dialerNotifier struct {
 }
 
 func (d *dialerNotifier) NotifySignal(signal *Signal) {
-	if signal == nil || signal.ConnectionID != d.ConnectionID || signal.NetworkID != d.networkID {
+	if signal == nil {
+		panic("nethernet: NotifySignal: signal is nil")
+	}
+	if signal.ConnectionID != d.ConnectionID || signal.NetworkID != d.networkID {
 		return
 	}
 	select {
