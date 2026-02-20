@@ -103,6 +103,19 @@ func (d Dialer) DialContext(ctx context.Context, networkID string, signaling Sig
 				stop()
 			}
 		}()
+		c := newConn(ice, dtls, sctp, d.ConnectionID, networkID, Addr{
+			NetworkID:    signaling.NetworkID(),
+			ConnectionID: d.ConnectionID,
+			Candidates:   candidates,
+		}, dialerConn{
+			Dialer: d,
+			stop:   stop,
+		})
+		defer func() {
+			if err != nil {
+				_ = c.Close()
+			}
+		}()
 
 		// Encode an offer using the local parameters!
 		dtlsParams.Role = webrtc.DTLSRoleServer
@@ -133,19 +146,6 @@ func (d Dialer) DialContext(ctx context.Context, networkID string, signaling Sig
 			}
 		}
 
-		c := newConn(ice, dtls, sctp, d.ConnectionID, networkID, Addr{
-			NetworkID:    signaling.NetworkID(),
-			ConnectionID: d.ConnectionID,
-			Candidates:   candidates,
-		}, dialerConn{
-			Dialer: d,
-			stop:   stop,
-		})
-		defer func() {
-			if err != nil {
-				_ = c.Close()
-			}
-		}()
 		for {
 			select {
 			case <-ctx.Done():
