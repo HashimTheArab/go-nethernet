@@ -95,6 +95,9 @@ func (conn *Conn) Read(b []byte) (n int, err error) {
 // received from the data channel responsible for the MessageReliability. An error may be
 // returned if the Conn has been closed by [Conn.Close].
 func (conn *Conn) Receive(r MessageReliability) ([]byte, error) {
+	if r >= messageReliabilityCapacity {
+		return nil, fmt.Errorf("invalid message reliability: %d", r)
+	}
 	select {
 	case <-conn.ctx.Done():
 		return nil, context.Cause(conn.ctx)
@@ -145,6 +148,9 @@ func (conn *Conn) Send(data []byte, reliability MessageReliability) (n int, err 
 	case <-conn.ctx.Done():
 		return 0, context.Cause(conn.ctx)
 	default:
+		if reliability >= messageReliabilityCapacity {
+			return 0, fmt.Errorf("invalid message reliability: %d", reliability)
+		}
 		if reliability == MessageReliabilityUnreliable && len(data) > maxMessageSize {
 			return 0, fmt.Errorf("data larger than %d (received: %d) cannot be sent over UnreliableDataChannel", maxMessageSize, len(data))
 		}
@@ -381,8 +387,7 @@ func (conn *Conn) handleSignal(signal *Signal) error {
 		if err != nil {
 			return fmt.Errorf("parse error code: %w", err)
 		}
-		conn.close(fmt.Errorf("nethernet: remote peer notified connection failure (code: %d)", code))
-		if err := conn.Close(); err != nil {
+		if err := conn.close(fmt.Errorf("nethernet: remote peer notified connection failure (code: %d)", code)); err != nil {
 			return fmt.Errorf("close: %w", err)
 		}
 	default:

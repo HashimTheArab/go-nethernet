@@ -154,7 +154,7 @@ func (c *dataChannel) handleMessage(b []byte) error {
 		return fmt.Errorf("parse: %w", err)
 	}
 
-	if c.reliability == MessageReliabilityUnreliable && msg.segments > 1 {
+	if c.reliability == MessageReliabilityUnreliable && msg.segments > 0 {
 		return fmt.Errorf("unexpected segment count on UnreliableDataChannel: %d", msg.segments)
 	}
 
