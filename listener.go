@@ -295,9 +295,20 @@ func (l *Listener) handleOffer(signal *Signal) error {
 		if len(dtlsParams.Fingerprints) == 0 {
 			return wrapSignalError(errors.New("local DTLS parameters has no fingerprints"), ErrorCodeFailedToCreateAnswer)
 		}
-		sctpCapabilities := sctp.GetCapabilities()
+
+		c := newConn(ice, dtls, sctp, signal.ConnectionID, signal.NetworkID, Addr{
+			NetworkID:  l.networkID,
+			Candidates: candidates,
+		}, l)
+		established := false
+		defer func() {
+			if !established {
+				_ = c.Close()
+			}
+		}()
 
 		// Encode an answer using the local parameters!
+		sctpCapabilities := sctp.GetCapabilities()
 		answer, err := description{
 			ice:  iceParams,
 			dtls: dtlsParams,
@@ -328,13 +339,9 @@ func (l *Listener) handleOffer(signal *Signal) error {
 			}
 		}
 
-		c := newConn(ice, dtls, sctp, signal.ConnectionID, signal.NetworkID, Addr{
-			NetworkID:  l.networkID,
-			Candidates: candidates,
-		}, l)
-
 		l.connections.Store(c.remoteAddr().String(), c)
 		go l.handleConn(c, desc)
+		established = true
 
 		return nil
 	}
