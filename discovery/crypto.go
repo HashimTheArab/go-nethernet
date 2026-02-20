@@ -30,6 +30,9 @@ func decrypt(src []byte) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("make block: %w", err)
 	}
+	if len(src) == 0 || len(src)%block.BlockSize() != 0 {
+		return nil, fmt.Errorf("invalid ciphertext length: %d", len(src))
+	}
 	mode := ecb.NewECBDecrypter(block)
 	dst := make([]byte, len(src))
 	mode.CryptBlocks(dst, src)
