@@ -172,7 +172,7 @@ func (d Dialer) DialContext(ctx context.Context, networkID string, signaling Sig
 						return nil, fmt.Errorf("parse offer: %w", err)
 					}
 
-					go d.handleConn(c.Context(), c, signals)
+					go d.handleConn(c, signals)
 
 					select {
 					case <-ctx.Done():
@@ -279,13 +279,10 @@ func (d Dialer) startTransports(ctx context.Context, conn *Conn, desc *descripti
 }
 
 // handleConn handles incoming Signals signaled from the remote connection and calls Conn.handleSignal
-// to handle them within the Conn. The [context.Context] is used to return immediately when it has been
-// canceled or exceeded the deadline.
-func (d Dialer) handleConn(ctx context.Context, conn *Conn, signals <-chan *Signal) {
+// to handle them within the Conn. It returns when the Conn context is canceled.
+func (d Dialer) handleConn(conn *Conn, signals <-chan *Signal) {
 	for {
 		select {
-		case <-ctx.Done():
-			return
 		case <-conn.ctx.Done():
 			return
 		case signal, ok := <-signals:
