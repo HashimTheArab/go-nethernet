@@ -381,8 +381,7 @@ func (conn *Conn) handleSignal(signal *Signal) error {
 		if err != nil {
 			return fmt.Errorf("parse error code: %w", err)
 		}
-		conn.close(fmt.Errorf("nethernet: remote peer notified connection failure (code: %d)", code))
-		if err := conn.Close(); err != nil {
+		if err := conn.close(fmt.Errorf("nethernet: remote peer notified connection failure (code: %d)", code)); err != nil {
 			return fmt.Errorf("close: %w", err)
 		}
 	default:

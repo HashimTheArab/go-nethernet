@@ -128,8 +128,9 @@ type Listener struct {
 // notifier holds a buffered input channel and a caller-provided output
 // channel for relaying incoming signals to a [nethernet.Listener].
 type notifier struct {
-	in  chan *nethernet.Signal
-	out chan<- *nethernet.Signal
+	in   chan *nethernet.Signal
+	out  chan<- *nethernet.Signal
+	stop chan struct{}
 }
 
 // Signal sends a NetherNet signal to the corresponding address for the network ID.
@@ -169,8 +170,9 @@ func (l *Listener) Notify(signals chan<- *nethernet.Signal) (stop func()) {
 	i := l.notifyCount
 	n := notifier{
 		// Buffer notifications so packet handling never blocks under lock.
-		in:  make(chan *nethernet.Signal, 64),
-		out: signals,
+		in:   make(chan *nethernet.Signal, 64),
+		out:  signals,
+		stop: make(chan struct{}),
 	}
 	l.notifiers[i] = n
 	l.notifyCount++
@@ -178,8 +180,20 @@ func (l *Listener) Notify(signals chan<- *nethernet.Signal) (stop func()) {
 
 	go func() {
 		defer close(signals)
-		for sig := range n.in {
-			n.out <- sig
+		for {
+			select {
+			case <-n.stop:
+				return
+			case sig, ok := <-n.in:
+				if !ok {
+					return
+				}
+				select {
+				case <-n.stop:
+					return
+				case n.out <- sig:
+				}
+			}
 		}
 	}()
 
@@ -204,6 +218,7 @@ func (l *Listener) stop(i uint32) {
 		return
 	}
 	delete(l.notifiers, i)
+	close(n.stop)
 	close(n.in)
 }
 
