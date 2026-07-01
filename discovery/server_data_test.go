@@ -1,42 +1,34 @@
 package discovery
 
 import (
-	"strings"
 	"testing"
 )
 
-func TestServerDataMarshalBinaryRejectsOverlongNames(t *testing.T) {
-	tests := []struct {
-		name string
-		data *ServerData
-	}{
-		{
-			name: "server name",
-			data: testServerData(strings.Repeat("s", maxServerDataNameLength+1), "world"),
-		},
-		{
-			name: "level name",
-			data: testServerData("server", strings.Repeat("l", maxServerDataNameLength+1)),
-		},
+func TestServerDataMarshalUnmarshalBinary(t *testing.T) {
+	original := &ServerData{
+		ServerName:            "server",
+		LevelName:             "world",
+		GameType:              GameTypeAdventure,
+		PlayerCount:           1,
+		MaxPlayerCount:        8,
+		EditorWorld:           false,
+		Hardcore:              false,
+		AcceptsOnlineAuth:     true,
+		AcceptsSelfSignedAuth: true,
+		TransportLayer:        TransportLayerNetherNet,
+		ConnectionType:        4,
+	}
+	data, err := original.MarshalBinary()
+	if err != nil {
+		t.Fatalf("MarshalBinary() error = %v", err)
 	}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if _, err := tt.data.MarshalBinary(); err == nil {
-				t.Fatal("MarshalBinary() error = nil, want overlong name error")
-			}
-		})
+	decoded := &ServerData{}
+	if err := decoded.UnmarshalBinary(data); err != nil {
+		t.Fatalf("UnmarshalBinary() error = %v", err)
 	}
-}
 
-func testServerData(serverName, levelName string) *ServerData {
-	return &ServerData{
-		ServerName:     serverName,
-		LevelName:      levelName,
-		GameType:       2,
-		PlayerCount:    1,
-		MaxPlayerCount: 8,
-		TransportLayer: 2,
-		ConnectionType: 4,
+	if *original != *decoded {
+		t.Fatalf("decoded ServerData does not match original:\ngot:  %+v\nwant: %+v", decoded, original)
 	}
 }

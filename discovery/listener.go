@@ -372,9 +372,9 @@ func (l *Listener) PongData(b []byte) {
 	l.ServerData(d)
 }
 
-// parsePongGameType converts the game type string from the pong data to its uint8 representation.
+// parsePongGameType converts the game type string from the pong data to its int32 representation.
 // Returns 0 and false if the game type is not valid.
-func parsePongGameType(v string) (uint8, bool) {
+func parsePongGameType(v string) (int32, bool) {
 	switch strings.ToLower(strings.TrimSpace(v)) {
 	case "survival":
 		return 0, true
