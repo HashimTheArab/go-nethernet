@@ -174,15 +174,14 @@ func (conn *Conn) Context() context.Context {
 	return conn.ctx
 }
 
-// Write writes the data into the 'ReliableDataChannel'. If the data exceeds 10000 bytes, it is split into
-// multiple segments. An error may be returned while writing a segment or if the Conn has been closed by [Conn.Close].
+// Write queues the data on the 'ReliableDataChannel'. See [Conn.Send].
 func (conn *Conn) Write(b []byte) (n int, err error) {
 	return conn.Send(b, MessageReliabilityReliable)
 }
 
-// Send writes the data into the data channel responsible for the given MessageReliability.
-// If the data exceeds 10,000 bytes, it is split into multiple segments. An error may be
-// returned while writing one or more segments or the Conn has been closed by [Conn.Close].
+// Send queues the data on the data channel for the given MessageReliability, split into
+// segments of at most the negotiated size. Delivery is asynchronous: a nil error means the
+// data was accepted in order, and it is sent as the channel opens and gains room.
 func (conn *Conn) Send(data []byte, reliability MessageReliability) (n int, err error) {
 	select {
 	case <-conn.ctx.Done():
@@ -218,7 +217,7 @@ func (conn *Conn) Send(data []byte, reliability MessageReliability) (n int, err 
 		remaining := totalSegments - 1
 		for i := 0; i < len(data); i += segmentSize {
 			frag := data[i:min(len(data), i+segmentSize)]
-			if err := d.Send(append([]byte{uint8(remaining)}, frag...)); err != nil {
+			if err := d.out.push(append([]byte{uint8(remaining)}, frag...)); err != nil {
 				return n, fmt.Errorf("write segment #%d: %w", totalSegments-1-remaining, closedWriteError(err))
 			}
 			n += len(frag)
