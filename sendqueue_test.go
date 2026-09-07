@@ -360,3 +360,41 @@ func TestConnWriteQueuesWhileDataChannelIsFull(t *testing.T) {
 		t.Fatalf("sent count = %d, want 0", got)
 	}
 }
+
+func TestConnSendClampsSegmentsToSendQueueBudget(t *testing.T) {
+	ctx, cancel := context.WithCancelCause(context.Background())
+	defer cancel(nil)
+
+	fake := newFakeSendChannel()
+	fake.budget = maxSendBufferedAmount
+	q := newSendQueue(fake, maxSendBufferedAmount, nil)
+	defer q.close(net.ErrClosed)
+
+	conn := &Conn{ctx: ctx}
+	conn.maxSegmentPayload.Store(2 * maxSendBufferedAmount)
+	conn.storeChannel(MessageReliabilityReliable, &dataChannel{out: q})
+
+	data := make([]byte, maxSendBufferedAmount+10)
+	n, err := conn.Write(data)
+	if err != nil {
+		t.Fatalf("Write error = %v, want nil", err)
+	}
+	if n != len(data) {
+		t.Fatalf("Write = %d, want %d", n, len(data))
+	}
+
+	frag := wait(t, fake.sentCh, "first fragment")
+	if len(frag) != maxSendBufferedAmount || frag[0] != 1 {
+		t.Fatalf("first fragment = %d bytes with prefix %d, want %d bytes with prefix 1", len(frag), frag[0], maxSendBufferedAmount)
+	}
+	fake.release(uint64(len(frag)))
+	frag = wait(t, fake.sentCh, "last fragment")
+	if len(frag) != 12 || frag[0] != 0 {
+		t.Fatalf("last fragment = %d bytes with prefix %d, want 12 bytes with prefix 0", len(frag), frag[0])
+	}
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	if fake.violations != 0 {
+		t.Fatalf("%d sends exceeded the buffered-amount budget", fake.violations)
+	}
+}
