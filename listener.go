@@ -171,15 +171,14 @@ func (conf ListenConfig) Listen(signaling Signaling) (*Listener, error) {
 		networkID: networkID,
 		id:        id,
 
-		incoming: make(chan *Conn),
-		signals:  make(chan *Signal, 64),
+		incoming:     make(chan *Conn),
+		negotiations: make(map[negotiationKey]*listenerNegotiator),
 
 		closed: make(chan struct{}),
 	}
 
 	stop := signaling.Notify(l)
 	l.stop = stop
-	go l.listen()
 
 	return l, nil
 }
@@ -193,14 +192,444 @@ type Listener struct {
 	// id is the numerical identifier for the Listener.
 	id uint64
 
-	connections sync.Map
-
 	incoming chan *Conn
-	signals  chan *Signal
+	// negotiations is a map where each key is the identifiers for the connection that is
+	// being/or already negotiated in the Listener, and each value is a listenerNegotiator
+	// which negotiates WebRTC peers with a remote network.
+	negotiations map[negotiationKey]*listenerNegotiator
+	// negotiationsMu guards negotiations from concurrent read/write access.
+	negotiationsMu sync.RWMutex
 
-	stop   func()
+	// stop is a function called to stop notifying signals from [Signaling].
+	stop func()
+	// closed is a channel that is closed when the Listener is closed.
+	closed chan struct{}
+	// once ensures that the closure occurs only once.
+	once sync.Once
+}
+
+// negotiationKey represents a key used for identifying a negotiation
+// initiated by an offer signal.
+type negotiationKey struct {
+	// networkID identifies the remote network. Multiple connections
+	// may contain the same ID if they're from the same network.
+	networkID string
+	// connectionID identifies the remote connection to be negotiated.
+	// It is a randomly-generated value assigned by the client.
+	connectionID uint64
+}
+
+// listenerNegotiator negotiates a WebRTC peer connection with the remote network.
+// Each negotiator has its own goroutine so other connections are not blocked by
+// the negotiation (local ICE candidate gathering) or user-defined methods, such
+// as VerifyClientToken.
+type listenerNegotiator struct {
+	key     negotiationKey
+	signals chan *Signal
+
 	closed chan struct{}
 	once   sync.Once
+	// closeMu guards closed and signals from concurrent access from
+	// handleClose and enqueueSignal since handleClose can be called
+	// concurrently from another goroutine in Conn.
+	closeMu sync.Mutex
+
+	// conn is the Conn that is being negotiated. It should only be
+	// accessed from background goroutine to avoid concurrent access.
+	conn *Conn
+
+	// Listener is the parent Listener that received the offer signal via NotifySignal.
+	*Listener
+}
+
+// enqueueSignal enqueues the given Signal to the negotiator to be handled in the background goroutine.
+// If the channel buffer is full (more than 32 signals) or the negotiator is no longer in use, it will
+// return false. The resulting value should be returned from [Listener.NotifySignal].
+func (n *listenerNegotiator) enqueueSignal(signal *Signal) bool {
+	n.closeMu.Lock()
+	defer n.closeMu.Unlock()
+
+	select {
+	case <-n.closed:
+		return false
+	default:
+	}
+
+	select {
+	case n.signals <- signal:
+		return true
+	default:
+		return false
+	}
+}
+
+// background goes as a background goroutine for the negotiator.
+func (n *listenerNegotiator) background() {
+	for {
+		select {
+		case <-n.closed:
+			// TODO: case <-time.After(inactivityTimeout):
+			return
+		case signal, ok := <-n.signals:
+			if !ok {
+				return
+			}
+			var err error
+			switch signal.Type {
+			case SignalTypeOffer:
+				err = n.handleOffer(signal)
+			default:
+				err = n.handleSignal(signal)
+			}
+			if err != nil {
+				var s *signalError
+				if errors.As(err, &s) {
+					if err := n.signaling.Signal(n.Context(), &Signal{
+						Type:         SignalTypeError,
+						ConnectionID: signal.ConnectionID,
+						Data:         strconv.FormatUint(uint64(s.code), 10),
+						NetworkID:    signal.NetworkID,
+					}); err != nil {
+						n.conf.Log.Error("error signaling error", slog.Any("error", err))
+					}
+				}
+				n.conf.Log.Error("error handling signal", slog.Any("signal", signal), slog.Any("error", err))
+
+				if signal.Type == SignalTypeOffer {
+					// We need to manually unregister the negotiator from the Listener here
+					// since Conn was not created and therefore handleClose is never called.
+					n.close()
+					return
+				}
+			}
+		}
+	}
+}
+
+// close unregisters the negotiator from the parent Listener and closes the
+// channels so the background goroutine can abort it. It should be called
+// when the negotiation is unrecoverable or the Conn is closed.
+func (n *listenerNegotiator) close() {
+	n.once.Do(func() {
+		n.negotiationsMu.Lock()
+		delete(n.negotiations, n.key)
+		n.negotiationsMu.Unlock()
+
+		n.closeMu.Lock()
+		close(n.closed)
+		close(n.signals)
+		n.closeMu.Unlock()
+	})
+}
+
+// handleOffer handles an incoming Signal of SignalTypeOffer. It parses the data of Signal into [sdp.SessionDescription]
+// and transforms into remote description for later use in negotiation. An answer will be created from local parameters of
+// each transport and signaled back to the remote connection referenced in the offer.
+func (n *listenerNegotiator) handleOffer(signal *Signal) error {
+	if n.conn != nil {
+		return wrapSignalError(errors.New("duplicate offer for same connection"), ErrorCodeIncomingConnectionIgnored)
+	}
+
+	d := &sdp.SessionDescription{}
+	if err := d.UnmarshalString(signal.Data); err != nil {
+		return wrapSignalError(fmt.Errorf("decode offer: %w", err), ErrorCodeFailedToSetRemoteDescription)
+	}
+	desc, err := parseDescription(d)
+	if err != nil {
+		return wrapSignalError(fmt.Errorf("parse offer: %w", err), ErrorCodeFailedToSetRemoteDescription)
+	}
+
+	var (
+		ctx    context.Context
+		parent = n.Context()
+	)
+	if n.conf.NegotiationContext != nil {
+		var cancel context.CancelFunc
+		ctx, cancel = n.conf.NegotiationContext(parent)
+		if ctx == nil {
+			panic("nethernet: Listener: NegotiationContext returned nil")
+		}
+		defer cancel()
+	} else {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(parent, time.Second*15)
+		defer cancel()
+	}
+	credentials, err := n.signaling.Credentials(ctx)
+	if err != nil {
+		return wrapSignalError(fmt.Errorf("obtain credentials: %w", err), ErrorCodeSignalingTurnAuthFailed)
+	}
+
+	c, err := newConn(
+		n.conf.API,
+		gatherOptions(credentials, n.conf.ICEGatherPolicy),
+		signal.ConnectionID,
+		signal.NetworkID,
+		n.networkID,
+		n,
+		ErrorCodeFailedToCreateAnswer,
+	)
+	if err != nil {
+		return fmt.Errorf("create peer connection: %w", err)
+	}
+	established := false
+	defer func() {
+		if !established {
+			_ = c.Close()
+		}
+	}()
+	disableTrickleICE := shouldDisableTrickleICE(n.conf.DisableTrickleICE, n.signaling)
+	if disableTrickleICE {
+		c.description.candidates, err = c.gatherCandidates(ctx)
+		if err != nil {
+			return wrapSignalError(fmt.Errorf("gather local candidates: %w", err), ErrorCodeICE)
+		}
+	}
+	for _, candidate := range desc.candidates {
+		// Non-trickle ICE connection may include candidates in a single SDP.
+		if err := c.addRemoteCandidate(candidate); err != nil {
+			return wrapSignalError(fmt.Errorf("add inline candidate: %w", err), ErrorCodeFailedToSetRemoteDescription)
+		}
+	}
+	c.description.dtls.Role = n.answererRole(desc.dtls.Role)
+
+	if desc.identity != nil {
+		publicKey, err := n.conf.VerifyClientToken(ctx, desc.identity.Assertion.Token)
+		if err != nil {
+			return wrapSignalError(fmt.Errorf("verify client token: %w", err), ErrorCodeIdentityNotAllowed)
+		}
+		if publicKey == nil {
+			publicKey, err = claimPublicKey(desc.identity.Assertion.Token, false)
+			if err != nil {
+				return wrapSignalError(fmt.Errorf("claim public key: %w", err), ErrorCodeIdentityNotAllowed)
+			}
+		}
+		if err := desc.identity.verify(desc, publicKey); err != nil {
+			return wrapSignalError(fmt.Errorf("verify identity assertion: %w", err), ErrorCodeIdentityNotAllowed)
+		}
+		c.publicKey = publicKey
+	} else if !n.conf.AllowAnonymous {
+		n.conf.Log.Warn("rejecting anonymous identity because AllowAnonymous is false",
+			slog.Uint64("connectionID", signal.ConnectionID),
+			slog.String("networkID", signal.NetworkID),
+		)
+		return wrapSignalError(errors.New("nethernet: anonymous identity not allowed"), ErrorCodeIdentityNotAllowed)
+	}
+	identity, err := n.conf.IssueServerIdentity(ctx)
+	if err != nil {
+		return wrapSignalError(fmt.Errorf("issue server identity: %w", err), ErrorCodeFailedToCreateIdentityAssertion)
+	}
+	if err := identity.sign(c.description); err != nil {
+		return wrapSignalError(fmt.Errorf("generate identity assertion: %w", err), ErrorCodeFailedToCreateIdentityAssertion)
+	}
+
+	// Register a callback function immediately since the remote peer
+	// may open data channels at any time while ICE candidates are being signaled.
+	var (
+		opened        atomic.Uint32
+		channelsReady = make(chan struct{})
+	)
+	c.sctp.OnDataChannel(func(channel *webrtc.DataChannel) {
+		for r := range messageReliabilityCapacity {
+			if r.Valid(channel) {
+				ch := wrapDataChannel(channel, r, c)
+				if existing := c.storeChannel(r, ch); existing != nil {
+					go c.close(fmt.Errorf("data channel created for same reliability parameters: %q", r.Parameters().Label))
+					return
+				}
+				channel.OnOpen(sync.OnceFunc(func() {
+					// If all data channels have been opened by remote peer, we can signal that the connection is ready.
+					if opened.Add(1) == uint32(messageReliabilityCapacity) {
+						close(channelsReady)
+					}
+				}))
+				return
+			}
+		}
+		go c.close(fmt.Errorf("invalid data channel opened: %q", channel.Label()))
+	})
+
+	// Encode an answer using the local parameters!
+	answer, err := c.description.encode()
+	if err != nil {
+		return wrapSignalError(fmt.Errorf("encode answer: %w", err), ErrorCodeFailedToCreateAnswer)
+	}
+
+	if err := n.signaling.Signal(ctx, &Signal{
+		Type:         SignalTypeAnswer,
+		ConnectionID: signal.ConnectionID,
+		Data:         string(answer),
+		NetworkID:    signal.NetworkID,
+	}); err != nil {
+		// I don't think the error code will be signaled back to the remote connection, but just in case.
+		return wrapSignalError(fmt.Errorf("signal answer: %w", err), ErrorCodeSignalingFailedToSend)
+	}
+
+	if !disableTrickleICE {
+		if err := c.trickleCandidates(n.signaling); err != nil {
+			return wrapSignalError(fmt.Errorf("start gathering local candidates: %w", err), ErrorCodeFailedToCreatePeerConnection)
+		}
+	}
+
+	n.conn = c
+	go n.handleConn(c, desc, channelsReady)
+	established = true
+	return nil
+}
+
+// answererRole returns the local [webrtc.DTLSRole] for an answer based on the
+// role signaled by the remote peer. If the remote peer uses
+// [webrtc.DTLSRoleAuto], it will be [webrtc.DTLSRoleClient] since the ICE
+// transport will always start as controlled.
+func (n *listenerNegotiator) answererRole(role webrtc.DTLSRole) webrtc.DTLSRole {
+	switch role {
+	case webrtc.DTLSRoleServer:
+		return webrtc.DTLSRoleClient
+	case webrtc.DTLSRoleClient:
+		return webrtc.DTLSRoleServer
+	default:
+		return webrtc.DTLSRoleClient
+	}
+}
+
+// handleSignal handles the given Signal received from the remote network in the Conn.
+func (n *listenerNegotiator) handleSignal(signal *Signal) error {
+	if n.conn == nil {
+		// Should not happen as long as we don't accept ICE candidates before offer in Listener.NotifySignal.
+		return fmt.Errorf("attempting to handle non-offer signal before creating a Conn")
+	}
+	return n.conn.handleSignal(signal)
+}
+
+// handleClose deletes the Conn from the Listener, since it is closed and can no longer be negotiated.
+func (n *listenerNegotiator) handleClose(*Conn) {
+	n.close()
+}
+
+// log extends the [slog.Logger] from [ListenConfig.Log] with an additional [slog.Attr] of "src" with the
+// value "listener" to mark that the Conn has been negotiated by Listener, and returns it to be used as the logger
+// of a Conn.
+func (n *listenerNegotiator) log() *slog.Logger {
+	return n.conf.Log.With(slog.String("src", "listener"))
+}
+
+// handleConn finalises the Conn. Once an ICE candidate for the Conn has been signaled from the remote
+// connection, it starts the transports of the Conn using the remote description and a context.Context]
+// returned from [ListenConfig.ConnContext].
+func (n *listenerNegotiator) handleConn(conn *Conn, d *description, channelsReady <-chan struct{}) {
+	var (
+		ctx    context.Context
+		parent = n.Context()
+	)
+	if n.conf.ConnContext != nil {
+		var cancel context.CancelFunc
+		ctx, cancel = n.conf.ConnContext(parent, conn)
+		if ctx == nil {
+			panic("nethernet: ConnContext returned nil")
+		}
+		defer cancel()
+	} else {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(parent, time.Second*5)
+		defer cancel()
+	}
+
+	var err error
+	defer func() {
+		if err != nil {
+			_ = conn.Close() // Stop notifying for the Conn.
+
+			if errors.Is(err, context.DeadlineExceeded) {
+				// ctx is already expired: use a fresh context so the signal has a chance to be delivered.
+				sigCtx, cancel := context.WithTimeout(n.Context(), time.Second*2)
+				defer cancel()
+				if err := n.signaling.Signal(sigCtx, &Signal{
+					Type:         SignalTypeError,
+					ConnectionID: conn.id,
+					Data:         strconv.Itoa(ErrorCodeNegotiationTimeoutWaitingForAccept),
+					NetworkID:    conn.networkID,
+				}); err != nil {
+					conn.log.Error("error signaling timeout", slog.Any("error", err))
+				}
+			}
+			if !errors.Is(err, net.ErrClosed) {
+				conn.log.Error("error starting transports", slog.Any("error", err))
+			}
+		}
+	}()
+
+	select {
+	case <-ctx.Done():
+		err = ctx.Err()
+	case <-n.closed:
+		err = net.ErrClosed
+	case <-conn.ctx.Done():
+		err = context.Cause(conn.ctx)
+	case <-conn.candidateReceived:
+		conn.log.Debug("received first candidate")
+		if err = n.startTransports(ctx, conn, d, channelsReady); err != nil {
+			conn.log.Error("error starting transports", slog.Any("error", err))
+			return
+		}
+
+		select {
+		case <-ctx.Done():
+			err = ctx.Err()
+		case <-conn.ctx.Done():
+			err = context.Cause(conn.ctx)
+		case <-n.closed:
+			_ = conn.Close()
+		case n.incoming <- conn:
+			// It is now safe to stop notifying for signals since we've already established the connection.
+			n.close()
+		}
+	}
+}
+
+// startTransports starts ICE as [webrtc.ICERoleControlled], then starts DTLS
+// and SCTP using the remote description. It blocks until the remote peer has
+// created both 'ReliableDataChannel' and 'UnreliableDataChannel'. The provided
+// [context.Context] is used to control the deadline.
+func (n *listenerNegotiator) startTransports(ctx context.Context, conn *Conn, d *description, channelsReady <-chan struct{}) error {
+	conn.log.Debug("starting ICE transport as controlled")
+	iceRole := webrtc.ICERoleControlled
+	if err := conn.ice.StartContext(ctx, nil, d.ice, &iceRole); err != nil {
+		return fmt.Errorf("start ICE: %w", err)
+	}
+
+	conn.log.Debug("starting DTLS transport", slog.String("remoteRole", d.dtls.Role.String()))
+	if err := conn.dtls.StartContext(ctx, d.dtls); err != nil {
+		return fmt.Errorf("start DTLS: %w", err)
+	}
+
+	conn.log.Debug("starting SCTP transport")
+	if err := withContextCancel(ctx, func() error {
+		return conn.sctp.Start(d.sctp)
+	}, func() {
+		_ = conn.sctp.Stop()
+	}); err != nil {
+		return fmt.Errorf("start SCTP: %w", err)
+	}
+
+	return n.waitForChannelsReady(ctx, conn, channelsReady)
+}
+
+// waitForChannelsReady blocks until all data channels have been opened by the
+// remote peer, or until the Listener, Conn, or context is closed.
+func (n *listenerNegotiator) waitForChannelsReady(ctx context.Context, conn *Conn, channelsReady <-chan struct{}) error {
+	select {
+	case <-n.closed:
+		return net.ErrClosed
+	case <-channelsReady:
+		return nil
+	case <-conn.ctx.Done():
+		return context.Cause(conn.ctx)
+	case <-ctx.Done():
+		if err := context.Cause(conn.ctx); err != nil {
+			return err
+		}
+		return context.Cause(ctx)
+	}
 }
 
 // Accept waits for and returns the next [Conn] to the Listener. An error may be
@@ -283,373 +712,36 @@ func (l *Listener) PongData(b []byte) {
 // whether it was accepted for processing.
 func (l *Listener) NotifySignal(signal *Signal) bool {
 	select {
-	case l.signals <- signal:
-		return true
 	case <-l.Context().Done():
 		return false
 	case <-l.signaling.Context().Done():
 		return false
 	default:
-		l.log().Warn("dropping signal because channel buffer is full", slog.Any("signal", signal))
-		return false
-	}
-}
+		key := negotiationKey{
+			networkID:    signal.NetworkID,
+			connectionID: signal.ConnectionID,
+		}
 
-// listen receives incoming signals sent from remote networks.
-// It is called as a goroutine from [ListenConfig.Listen] and initiates all incoming
-// connections from offers. When either the listener is closed or the signaling context
-// is canceled, the goroutine will automatically break.
-func (l *Listener) listen() {
-	for {
-		select {
-		case <-l.closed:
-			return
-		case <-l.signaling.Context().Done():
-			l.conf.Log.Warn("signaling context canceled",
-				slog.Any("error", context.Cause(l.signaling.Context())))
-			if err := l.Close(); err != nil {
-				l.conf.Log.Error("error closing listener due to cancellation of signaling context",
-					slog.Any("error", err))
+		l.negotiationsMu.Lock()
+		n, ok := l.negotiations[key]
+		if !ok {
+			if signal.Type != SignalTypeOffer {
+				l.conf.Log.Error("received non-offer signal for a non-existing negotiation", "signal", signal.String(), "networkID", signal.NetworkID)
+				l.negotiationsMu.Unlock()
+				return false
 			}
-			return
-		case signal := <-l.signals:
-			var err error
-			switch signal.Type {
-			case SignalTypeOffer:
-				err = l.handleOffer(signal)
-			default:
-				err = l.handleSignal(signal)
+			n = &listenerNegotiator{
+				key:      key,
+				signals:  make(chan *Signal, 32),
+				closed:   make(chan struct{}),
+				Listener: l,
 			}
-			if err != nil {
-				var s *signalError
-				if errors.As(err, &s) {
-					if err := l.signaling.Signal(l.Context(), &Signal{
-						Type:         SignalTypeError,
-						ConnectionID: signal.ConnectionID,
-						Data:         strconv.FormatUint(uint64(s.code), 10),
-						NetworkID:    signal.NetworkID,
-					}); err != nil {
-						l.conf.Log.Error("error signaling error", slog.Any("error", err))
-					}
-				}
-				l.conf.Log.Error("error handling signal", slog.Any("signal", signal), slog.Any("error", err))
-			}
+			l.negotiations[key] = n
+			go n.background()
 		}
-	}
-}
+		l.negotiationsMu.Unlock()
 
-// handleOffer handles an incoming Signal of SignalTypeOffer. It parses the data of Signal into [sdp.SessionDescription]
-// and transforms into remote description for later use in negotiation. An answer will be created from local parameters of
-// each transport and signaled back to the remote connection referenced in the offer.
-func (l *Listener) handleOffer(signal *Signal) error {
-	d := &sdp.SessionDescription{}
-	if err := d.UnmarshalString(signal.Data); err != nil {
-		return wrapSignalError(fmt.Errorf("decode offer: %w", err), ErrorCodeFailedToSetRemoteDescription)
-	}
-	desc, err := parseDescription(d)
-	if err != nil {
-		return wrapSignalError(fmt.Errorf("parse offer: %w", err), ErrorCodeFailedToSetRemoteDescription)
-	}
-
-	var (
-		ctx    context.Context
-		parent = l.Context()
-	)
-	if l.conf.NegotiationContext != nil {
-		var cancel context.CancelFunc
-		ctx, cancel = l.conf.NegotiationContext(parent)
-		if ctx == nil {
-			panic("nethernet: Listener: NegotiationContext returned nil")
-		}
-		defer cancel()
-	} else {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(parent, time.Second*15)
-		defer cancel()
-	}
-	credentials, err := l.signaling.Credentials(ctx)
-	if err != nil {
-		return wrapSignalError(fmt.Errorf("obtain credentials: %w", err), ErrorCodeSignalingTurnAuthFailed)
-	}
-
-	c, err := newConn(
-		l.conf.API,
-		gatherOptions(credentials, l.conf.ICEGatherPolicy),
-		signal.ConnectionID,
-		signal.NetworkID,
-		l.networkID,
-		l,
-		ErrorCodeFailedToCreateAnswer,
-	)
-	if err != nil {
-		return fmt.Errorf("create peer connection: %w", err)
-	}
-	established := false
-	defer func() {
-		if !established {
-			_ = c.Close()
-		}
-	}()
-	if _, exists := l.connections.LoadOrStore(c.remoteAddr().String(), c); exists {
-		return wrapSignalError(
-			fmt.Errorf("connection already exists for %s", c.remoteAddr()),
-			ErrorCodeIncomingConnectionIgnored,
-		)
-	}
-	disableTrickleICE := shouldDisableTrickleICE(l.conf.DisableTrickleICE, l.signaling)
-	if disableTrickleICE {
-		c.description.candidates, err = c.gatherCandidates(ctx)
-		if err != nil {
-			return wrapSignalError(fmt.Errorf("gather local candidates: %w", err), ErrorCodeICE)
-		}
-	}
-	for _, candidate := range desc.candidates {
-		// Non-trickle ICE connection may include candidates in a single SDP.
-		if err := c.addRemoteCandidate(candidate); err != nil {
-			return wrapSignalError(fmt.Errorf("add inline candidate: %w", err), ErrorCodeFailedToSetRemoteDescription)
-		}
-	}
-	c.description.dtls.Role = l.answererRole(desc.dtls.Role)
-
-	if desc.identity != nil {
-		publicKey, err := l.conf.VerifyClientToken(ctx, desc.identity.Assertion.Token)
-		if err != nil {
-			return wrapSignalError(fmt.Errorf("verify client token: %w", err), ErrorCodeIdentityNotAllowed)
-		}
-		if publicKey == nil {
-			publicKey, err = claimPublicKey(desc.identity.Assertion.Token, false)
-			if err != nil {
-				return wrapSignalError(fmt.Errorf("claim public key: %w", err), ErrorCodeIdentityNotAllowed)
-			}
-		}
-		if err := desc.identity.verify(desc, publicKey); err != nil {
-			return wrapSignalError(fmt.Errorf("verify identity assertion: %w", err), ErrorCodeIdentityNotAllowed)
-		}
-		c.publicKey = publicKey
-	} else if !l.conf.AllowAnonymous {
-		l.conf.Log.Warn("rejecting anonymous identity because AllowAnonymous is false",
-			slog.Uint64("connectionID", signal.ConnectionID),
-			slog.String("networkID", signal.NetworkID),
-		)
-		return wrapSignalError(errors.New("nethernet: anonymous identity not allowed"), ErrorCodeIdentityNotAllowed)
-	}
-	identity, err := l.conf.IssueServerIdentity(ctx)
-	if err != nil {
-		return wrapSignalError(fmt.Errorf("issue server identity: %w", err), ErrorCodeFailedToCreateIdentityAssertion)
-	}
-	if err := identity.sign(c.description); err != nil {
-		return wrapSignalError(fmt.Errorf("generate identity assertion: %w", err), ErrorCodeFailedToCreateIdentityAssertion)
-	}
-
-	// Register a callback function immediately since the remote peer
-	// may open data channels at any time while ICE candidates are being signaled.
-	var (
-		opened        atomic.Uint32
-		channelsReady = make(chan struct{})
-	)
-	c.sctp.OnDataChannel(func(channel *webrtc.DataChannel) {
-		for r := range messageReliabilityCapacity {
-			if r.Valid(channel) {
-				ch := wrapDataChannel(channel, r, c)
-				if existing := c.storeChannel(r, ch); existing != nil {
-					go c.close(fmt.Errorf("data channel created for same reliability parameters: %q", r.Parameters().Label))
-					return
-				}
-				channel.OnOpen(sync.OnceFunc(func() {
-					// If all data channels have been opened by remote peer, we can signal that the connection is ready.
-					if opened.Add(1) == uint32(messageReliabilityCapacity) {
-						close(channelsReady)
-					}
-				}))
-				return
-			}
-		}
-		go c.close(fmt.Errorf("invalid data channel opened: %q", channel.Label()))
-	})
-
-	// Encode an answer using the local parameters!
-	answer, err := c.description.encode()
-	if err != nil {
-		return wrapSignalError(fmt.Errorf("encode answer: %w", err), ErrorCodeFailedToCreateAnswer)
-	}
-
-	if err := l.signaling.Signal(ctx, &Signal{
-		Type:         SignalTypeAnswer,
-		ConnectionID: signal.ConnectionID,
-		Data:         string(answer),
-		NetworkID:    signal.NetworkID,
-	}); err != nil {
-		// I don't think the error code will be signaled back to the remote connection, but just in case.
-		return wrapSignalError(fmt.Errorf("signal answer: %w", err), ErrorCodeSignalingFailedToSend)
-	}
-
-	if !disableTrickleICE {
-		if err := c.trickleCandidates(l.signaling); err != nil {
-			return wrapSignalError(fmt.Errorf("start gathering local candidates: %w", err), ErrorCodeFailedToCreatePeerConnection)
-		}
-	}
-
-	go l.handleConn(c, desc, channelsReady)
-	established = true
-	return nil
-}
-
-// answererRole returns the local [webrtc.DTLSRole] for an answer based on the
-// role signaled by the remote peer. If the remote peer uses
-// [webrtc.DTLSRoleAuto], it will be [webrtc.DTLSRoleClient] since the ICE
-// transport will always start as controlled.
-func (l *Listener) answererRole(role webrtc.DTLSRole) webrtc.DTLSRole {
-	switch role {
-	case webrtc.DTLSRoleServer:
-		return webrtc.DTLSRoleClient
-	case webrtc.DTLSRoleClient:
-		return webrtc.DTLSRoleServer
-	default:
-		return webrtc.DTLSRoleClient
-	}
-}
-
-// handleSignal looks up for a Conn that matches the ConnectionID and NetworkID of the Signal.
-// If a matching connection is found, it notifies the Signal by calling Conn.handleSignal.
-func (l *Listener) handleSignal(signal *Signal) error {
-	addr := &Addr{
-		ConnectionID: signal.ConnectionID,
-		NetworkID:    signal.NetworkID,
-	}
-	conn, ok := l.connections.Load(addr.String())
-	if !ok {
-		return fmt.Errorf("no connection found for %s", addr)
-	}
-	return conn.(*Conn).handleSignal(signal)
-}
-
-// handleClose deletes the Conn from the Listener, since it is closed and can no longer be negotiated.
-func (l *Listener) handleClose(conn *Conn) {
-	l.connections.CompareAndDelete(conn.remoteAddr().String(), conn)
-}
-
-// log extends the [slog.Logger] from [ListenConfig.Log] with an additional [slog.Attr] of "src" with the
-// value "listener" to mark that the Conn has been negotiated by Listener, and returns it to be used as the logger
-// of a Conn.
-func (l *Listener) log() *slog.Logger {
-	return l.conf.Log.With(slog.String("src", "listener"))
-}
-
-// handleConn finalises the Conn. Once an ICE candidate for the Conn has been signaled from the remote
-// connection, it starts the transports of the Conn using the remote description and a context.Context]
-// returned from [ListenConfig.ConnContext].
-func (l *Listener) handleConn(conn *Conn, d *description, channelsReady <-chan struct{}) {
-	var (
-		ctx    context.Context
-		parent = l.Context()
-	)
-	if l.conf.ConnContext != nil {
-		var cancel context.CancelFunc
-		ctx, cancel = l.conf.ConnContext(parent, conn)
-		if ctx == nil {
-			panic("nethernet: ConnContext returned nil")
-		}
-		defer cancel()
-	} else {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(parent, time.Second*5)
-		defer cancel()
-	}
-
-	var err error
-	defer func() {
-		if err != nil {
-			_ = conn.Close() // Stop notifying for the Conn.
-
-			if errors.Is(err, context.DeadlineExceeded) {
-				// ctx is already expired: use a fresh context so the signal has a chance to be delivered.
-				sigCtx, cancel := context.WithTimeout(l.Context(), time.Second*2)
-				defer cancel()
-				if err := l.signaling.Signal(sigCtx, &Signal{
-					Type:         SignalTypeError,
-					ConnectionID: conn.id,
-					Data:         strconv.Itoa(ErrorCodeNegotiationTimeoutWaitingForAccept),
-					NetworkID:    conn.networkID,
-				}); err != nil {
-					conn.log.Error("error signaling timeout", slog.Any("error", err))
-				}
-			}
-			if !errors.Is(err, net.ErrClosed) {
-				conn.log.Error("error starting transports", slog.Any("error", err))
-			}
-		}
-	}()
-
-	select {
-	case <-ctx.Done():
-		err = ctx.Err()
-	case <-l.closed:
-		err = net.ErrClosed
-	case <-conn.ctx.Done():
-		err = context.Cause(conn.ctx)
-	case <-conn.candidateReceived:
-		conn.log.Debug("received first candidate")
-		if err = l.startTransports(ctx, conn, d, channelsReady); err != nil {
-			conn.log.Error("error starting transports", slog.Any("error", err))
-			return
-		}
-
-		select {
-		case <-ctx.Done():
-			err = ctx.Err()
-		case <-conn.ctx.Done():
-			err = context.Cause(conn.ctx)
-		case <-l.closed:
-			_ = conn.Close()
-		case l.incoming <- conn:
-		}
-	}
-}
-
-// startTransports starts ICE as [webrtc.ICERoleControlled], then starts DTLS
-// and SCTP using the remote description. It blocks until the remote peer has
-// created both 'ReliableDataChannel' and 'UnreliableDataChannel'. The provided
-// [context.Context] is used to control the deadline.
-func (l *Listener) startTransports(ctx context.Context, conn *Conn, d *description, channelsReady <-chan struct{}) error {
-	conn.log.Debug("starting ICE transport as controlled")
-	iceRole := webrtc.ICERoleControlled
-	if err := conn.ice.StartContext(ctx, nil, d.ice, &iceRole); err != nil {
-		return fmt.Errorf("start ICE: %w", err)
-	}
-
-	conn.log.Debug("starting DTLS transport", slog.String("remoteRole", d.dtls.Role.String()))
-	if err := conn.dtls.StartContext(ctx, d.dtls); err != nil {
-		return fmt.Errorf("start DTLS: %w", err)
-	}
-
-	conn.log.Debug("starting SCTP transport")
-	if err := withContextCancel(ctx, func() error {
-		return conn.sctp.Start(d.sctp)
-	}, func() {
-		_ = conn.sctp.Stop()
-	}); err != nil {
-		return fmt.Errorf("start SCTP: %w", err)
-	}
-	conn.maxSegmentPayload.Store(conn.sctp.GetCapabilities().MaxMessageSize - 1)
-
-	return l.waitForChannelsReady(ctx, conn, channelsReady)
-}
-
-// waitForChannelsReady blocks until all data channels have been opened by the
-// remote peer, or until the Listener, Conn, or context is closed.
-func (l *Listener) waitForChannelsReady(ctx context.Context, conn *Conn, channelsReady <-chan struct{}) error {
-	select {
-	case <-l.closed:
-		return net.ErrClosed
-	case <-channelsReady:
-		return nil
-	case <-conn.ctx.Done():
-		return context.Cause(conn.ctx)
-	case <-ctx.Done():
-		if err := context.Cause(conn.ctx); err != nil {
-			return err
-		}
-		return context.Cause(ctx)
+		return n.enqueueSignal(signal)
 	}
 }
 
