@@ -278,7 +278,6 @@ func (n *listenerNegotiator) background() {
 	for {
 		select {
 		case <-n.closed:
-			// TODO: case <-time.After(inactivityTimeout):
 			return
 		case signal, ok := <-n.signals:
 			if !ok {
@@ -322,7 +321,9 @@ func (n *listenerNegotiator) background() {
 func (n *listenerNegotiator) close() {
 	n.once.Do(func() {
 		n.negotiationsMu.Lock()
-		delete(n.negotiations, n.key)
+		if existing, ok := n.negotiations[n.key]; ok && existing == n {
+			delete(n.negotiations, n.key)
+		}
 		n.negotiationsMu.Unlock()
 
 		n.closeMu.Lock()
