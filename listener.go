@@ -278,8 +278,8 @@ func (n *listenerNegotiator) enqueueSignal(signal *Signal) bool {
 			if conn.Context().Err() != nil {
 				return false
 			}
-			// Candidate handling is short; remote errors cancel immediately and
-			// schedule transport teardown separately from the signaling callback.
+			// Remote errors close synchronously and call back into the negotiator,
+			// so no owner lock may be held while handling the signal.
 			if err := conn.handleSignal(signal); err != nil {
 				conn.log.Error("error handling signal", "error", err)
 				n.reportError(err)

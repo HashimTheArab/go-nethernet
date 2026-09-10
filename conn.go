@@ -82,8 +82,6 @@ type Conn struct {
 
 	// once ensures that the Conn is closed only once.
 	once sync.Once
-	// asyncCloseOnce limits remote-error teardown to one background goroutine.
-	asyncCloseOnce sync.Once
 
 	log *slog.Logger
 
@@ -408,8 +406,7 @@ func (conn *Conn) handleTransports() {
 // If the Signal is of SignalTypeCandidate, it parses a [webrtc.ICECandidate] from its data and
 // adds it to the ICE transport of the Conn.
 //
-// If the Signal is of SignalTypeError, it cancels the Conn immediately and
-// closes its transports in the background.
+// If the Signal is of SignalTypeError, it closes the Conn immediately.
 func (conn *Conn) handleSignal(signal *Signal) error {
 	switch signal.Type {
 	case SignalTypeCandidate:
@@ -425,24 +422,13 @@ func (conn *Conn) handleSignal(signal *Signal) error {
 		if err != nil {
 			return fmt.Errorf("parse error code: %w", err)
 		}
-		conn.closeAsync(fmt.Errorf("nethernet: remote peer notified connection failure (code: %d)", code))
+		if err := conn.close(fmt.Errorf("nethernet: remote peer notified connection failure (code: %d)", code)); err != nil {
+			return fmt.Errorf("close: %w", err)
+		}
 	default:
 		return fmt.Errorf("unknown signal type: %s", signal.Type)
 	}
 	return nil
-}
-
-// closeAsync cancels the Conn immediately and schedules transport teardown once.
-// Stopping transports can block, so signaling callbacks must not wait for it.
-func (conn *Conn) closeAsync(cause error) {
-	conn.asyncCloseOnce.Do(func() {
-		conn.cancel(cause)
-		go func() {
-			if err := conn.close(cause); err != nil {
-				conn.log.Error("error closing connection", slog.Any("error", err))
-			}
-		}()
-	})
 }
 
 // parseRemoteCandidate parses a raw ICE candidate string into a [webrtc.ICECandidate].
