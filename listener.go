@@ -177,8 +177,20 @@ func (conf ListenConfig) Listen(signaling Signaling) (*Listener, error) {
 		closed: make(chan struct{}),
 	}
 
+	// TODO: temp fix
+	stop2 := context.AfterFunc(signaling.Context(), func() {
+		l.conf.Log.Warn("signaling context canceled",
+			slog.Any("error", context.Cause(l.signaling.Context())))
+		if err := l.Close(); err != nil {
+			l.conf.Log.Error("error closing listener due to cancellation of signaling context",
+				slog.Any("error", err))
+		}
+	})
 	stop := signaling.Notify(l)
-	l.stop = stop
+	l.stop = func() {
+		stop()
+		stop2()
+	}
 
 	return l, nil
 }
