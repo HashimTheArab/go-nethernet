@@ -315,13 +315,16 @@ func TestListenerAcceptReleasesAdmission(t *testing.T) {
 func TestListenerErrorRepliesDoNotBlockNegotiations(t *testing.T) {
 	base := newBlockingCredentialsSignaling()
 	t.Cleanup(base.close)
-	signaling := blockedErrorSignaling{Signaling: base, started: make(chan context.Context, maxListenerSignalErrors)}
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release) })
+	signaling := blockedErrorSignaling{Signaling: base, started: make(chan context.Context, maxListenerSignalErrors), release: release}
 	l, err := (ListenConfig{Log: slog.New(slog.NewTextHandler(io.Discard, nil))}).Listen(signaling)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = l.Close() })
 	fillListenerErrorReplies(t, l, signaling.started)
+	waitListenerState(t, l, 0, 0, 0)
 	if !l.NotifySignal(&Signal{Type: SignalTypeOffer, NetworkID: "remote", ConnectionID: 1, Data: testOffer(t)}) {
 		t.Fatal("blocked error responses prevented a new negotiation")
 	}
@@ -339,10 +342,12 @@ func TestListenerErrorRepliesDoNotBlockNegotiations(t *testing.T) {
 	waitListenerState(t, l, 0, 0, 0)
 }
 
-// blockedErrorSignaling holds error responses until their delivery context ends.
+// blockedErrorSignaling holds error responses until their delivery context ends,
+// or until an explicit release when testing a backend that stalls past cancellation.
 type blockedErrorSignaling struct {
 	Signaling
 	started chan context.Context
+	release <-chan struct{}
 }
 
 // Signal stalls error replies while forwarding normal negotiation signals.
@@ -351,6 +356,10 @@ func (s blockedErrorSignaling) Signal(ctx context.Context, signal *Signal) error
 		return s.Signaling.Signal(ctx, signal)
 	}
 	s.started <- ctx
+	if s.release != nil {
+		<-s.release
+		return nil
+	}
 	<-ctx.Done()
 	return ctx.Err()
 }

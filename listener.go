@@ -583,7 +583,7 @@ func (n *listenerNegotiator) handleConn(conn *Conn, d *description, channelsRead
 			}
 			_ = conn.Close() // Stop notifying for the Conn.
 
-			if errors.Is(err, context.DeadlineExceeded) {
+			if errors.Is(ctx.Err(), context.DeadlineExceeded) {
 				n.signalError(&Signal{ConnectionID: conn.id, NetworkID: conn.networkID}, ErrorCodeNegotiationTimeoutWaitingForAccept)
 			}
 			if !errors.Is(err, net.ErrClosed) {
@@ -851,8 +851,13 @@ func (e *signalError) Unwrap() error { return e.underlying }
 
 // wrapSignalError returns a signalError that includes the error as its underlying error (which may be
 // unwrapped with [errors.Unwrap]) and the code to be signaled back to the remote connection. It is typically
-// called by methods handling incoming Signals on the Listener.
-func wrapSignalError(err error, code int) *signalError {
+// called by methods handling incoming Signals on the Listener. Errors that already wrap a signalError
+// are returned unchanged, preserving their original code and context.
+func wrapSignalError(err error, code int) error {
+	var existing *signalError
+	if errors.As(err, &existing) {
+		return err
+	}
 	return &signalError{code: code, underlying: err}
 }
 

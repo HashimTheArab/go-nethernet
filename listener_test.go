@@ -4,10 +4,56 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
+	"io"
 	"log/slog"
 	"strings"
 	"testing"
+	"time"
 )
+
+func TestListenerTimeoutReplyUsesConnContext(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		expired bool
+		cause   error
+	}{
+		{"transport closed after deadline", true, errors.New("ICE transport closed")},
+		{"candidate signaling deadline", false, fmt.Errorf("signal candidate: %w", context.DeadlineExceeded)},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ctx := context.Background()
+			if test.expired {
+				var cancel context.CancelFunc
+				ctx, cancel = context.WithDeadline(ctx, time.Now().Add(-time.Second))
+				defer cancel()
+			}
+			log := slog.New(slog.NewTextHandler(io.Discard, nil))
+			release := make(chan struct{})
+			defer close(release)
+			l := &Listener{
+				conf: ListenConfig{Log: log, ConnContext: func(context.Context, *Conn) (context.Context, context.CancelFunc) {
+					return ctx, func() {}
+				}},
+				signaling:  blockedErrorSignaling{started: make(chan context.Context, 1), release: release},
+				errorSlots: make(chan struct{}, 1),
+				closed:     make(chan struct{}),
+			}
+			connCtx, cancel := context.WithCancelCause(context.Background())
+			cancel(test.cause)
+			conn := &Conn{ctx: connCtx, log: log}
+			// Model transports that have already closed with the specified cause.
+			conn.once.Do(func() {})
+			n := &listenerNegotiator{Listener: l, closed: make(chan struct{})}
+			close(n.closed)
+			n.handleConn(conn, nil, make(chan struct{}))
+			// Delivery stays blocked, so any dispatched reply still owns its slot.
+			if got := len(l.errorSlots) != 0; got != test.expired {
+				t.Fatalf("timeout reply dispatched = %v, want %v", got, test.expired)
+			}
+		})
+	}
+}
 
 func TestListenerHandleConnPreservesFailureCause(t *testing.T) {
 	var output bytes.Buffer
@@ -67,5 +113,13 @@ func TestListenerConnectionOwnership(t *testing.T) {
 	first.close()
 	if _, ok := l.negotiations[key]; ok {
 		t.Fatal("closed owner remains registered")
+	}
+}
+
+func TestWrapSignalErrorPreservesExistingCode(t *testing.T) {
+	inner := wrapSignalError(errors.New("bad offer"), ErrorCodeFailedToSetRemoteDescription)
+	outer := fmt.Errorf("negotiate: %w", inner)
+	if got := wrapSignalError(outer, ErrorCodeFailedToCreateAnswer); got != outer {
+		t.Fatalf("wrapSignalError replaced an existing signal error: %v", got)
 	}
 }
