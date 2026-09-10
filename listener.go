@@ -499,9 +499,7 @@ func (n *listenerNegotiator) handleOffer(signal *Signal) error {
 	n.mu.Unlock()
 
 	for _, deferredSignal := range deferred {
-		if err := c.handleSignal(deferredSignal); err != nil {
-			return fmt.Errorf("handle deferred signal: %w", err)
-		}
+		n.enqueueSignal(deferredSignal)
 	}
 
 	if err := n.finaliseConn(c, desc, channelsReady); err != nil {

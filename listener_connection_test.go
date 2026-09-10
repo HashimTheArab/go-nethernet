@@ -21,6 +21,59 @@ func TestAcceptedConnUsesNegotiatedMessageSize(t *testing.T) {
 	checkConnPayload(t, serverConn, clientConn, bytes.Repeat([]byte{0x5a}, 2048))
 }
 
+func TestListenerIgnoresMalformedDeferredSignals(t *testing.T) {
+	for _, kind := range []string{SignalTypeCandidate, SignalTypeError} {
+		t.Run(kind, func(t *testing.T) {
+			client, server := newMemorySignalingPair("client", "server")
+			t.Cleanup(client.close)
+			t.Cleanup(server.close)
+			gate := newBlockingCredentialsSignaling()
+			t.Cleanup(gate.close)
+			_, clientConn, serverConn := dialAcceptedListener(t,
+				earlyMalformedSignaling{Signaling: client, gate: gate, kind: kind},
+				gatedOfferSignaling{Signaling: server, gate: gate},
+			)
+			checkConnPayload(t, clientConn, serverConn, []byte("handshake survived malformed signal"))
+		})
+	}
+}
+
+// gatedOfferSignaling holds offer processing until an early signal is delivered.
+type gatedOfferSignaling struct {
+	Signaling
+	gate *blockingCredentialsSignaling
+}
+
+// Credentials pauses the offer while the client injects a malformed signal.
+func (s gatedOfferSignaling) Credentials(ctx context.Context) (*Credentials, error) {
+	return s.gate.Credentials(ctx)
+}
+
+// earlyMalformedSignaling injects one malformed signal before the answer is built.
+type earlyMalformedSignaling struct {
+	Signaling
+	gate *blockingCredentialsSignaling
+	kind string
+}
+
+// Signal defers an invalid candidate or error while offer credentials are blocked.
+func (s earlyMalformedSignaling) Signal(ctx context.Context, signal *Signal) error {
+	if err := s.Signaling.Signal(ctx, signal); err != nil {
+		return err
+	}
+	if signal.Type != SignalTypeOffer {
+		return nil
+	}
+	select {
+	case <-s.gate.started:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	err := s.Signaling.Signal(ctx, &Signal{Type: s.kind, NetworkID: signal.NetworkID, ConnectionID: signal.ConnectionID, Data: "invalid"})
+	close(s.gate.release)
+	return err
+}
+
 func TestListenerRejectsDuplicateAfterAccept(t *testing.T) {
 	client, server := newMemorySignalingPair("client", "server")
 	t.Cleanup(client.close)
