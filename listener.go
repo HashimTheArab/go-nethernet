@@ -177,8 +177,8 @@ func (conf ListenConfig) Listen(signaling Signaling) (*Listener, error) {
 		closed: make(chan struct{}),
 	}
 
-	// TODO: temp fix
-	stop2 := context.AfterFunc(signaling.Context(), func() {
+	stop := signaling.Notify(l)
+	l.stop, l.stopAfter = stop, context.AfterFunc(signaling.Context(), func() {
 		l.conf.Log.Warn("signaling context canceled",
 			slog.Any("error", context.Cause(l.signaling.Context())))
 		if err := l.Close(); err != nil {
@@ -186,11 +186,6 @@ func (conf ListenConfig) Listen(signaling Signaling) (*Listener, error) {
 				slog.Any("error", err))
 		}
 	})
-	stop := signaling.Notify(l)
-	l.stop = func() {
-		stop()
-		stop2()
-	}
 
 	return l, nil
 }
@@ -205,6 +200,7 @@ type Listener struct {
 	id uint64
 
 	incoming chan *Conn
+
 	// negotiations is a map where each key is the identifiers for the connection that is
 	// being/or already negotiated in the Listener, and each value is a listenerNegotiator
 	// which negotiates WebRTC peers with a remote network.
@@ -214,6 +210,8 @@ type Listener struct {
 
 	// stop is a function called to stop notifying signals from [Signaling].
 	stop func()
+	// stopAfter is a function called to stop notifying cancellation of [Signaling.Context].
+	stopAfter func() bool
 	// closed is a channel that is closed when the Listener is closed.
 	closed chan struct{}
 	// once ensures that the closure occurs only once.
@@ -307,7 +305,7 @@ func (n *listenerNegotiator) background() {
 				}
 				n.conf.Log.Error("error handling signal", slog.Any("signal", signal), slog.Any("error", err))
 
-				if signal.Type == SignalTypeOffer {
+				if signal.Type == SignalTypeOffer && n.conn == nil {
 					// We need to manually unregister the negotiator from the Listener here
 					// since Conn was not created and therefore handleClose is never called.
 					n.close()
@@ -782,6 +780,7 @@ func (l *Listener) Close() error {
 	l.once.Do(func() {
 		close(l.closed)
 		l.stop()
+		l.stopAfter()
 	})
 	return nil
 }
