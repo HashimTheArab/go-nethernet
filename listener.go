@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"math/rand/v2"
 	"net"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -173,6 +174,7 @@ func (conf ListenConfig) Listen(signaling Signaling) (*Listener, error) {
 
 		incoming:     make(chan *Conn),
 		negotiations: make(map[negotiationKey]*listenerNegotiator),
+		sem:          make(chan struct{}, 64),
 
 		closed: make(chan struct{}),
 	}
@@ -207,6 +209,7 @@ type Listener struct {
 	negotiations map[negotiationKey]*listenerNegotiator
 	// negotiationsMu guards negotiations from concurrent read/write access.
 	negotiationsMu sync.RWMutex
+	sem            chan struct{}
 
 	// stop is a function called to stop notifying signals from [Signaling].
 	stop func()
@@ -234,18 +237,11 @@ type negotiationKey struct {
 // the negotiation (local ICE candidate gathering) or user-defined methods, such
 // as VerifyClientToken.
 type listenerNegotiator struct {
-	key     negotiationKey
-	signals chan *Signal
+	key negotiationKey
 
-	closed chan struct{}
-	once   sync.Once
-	// closeMu guards closed and signals from concurrent access from
-	// handleClose and enqueueSignal since handleClose can be called
-	// concurrently from another goroutine in Conn.
-	closeMu sync.Mutex
+	deferred []*Signal
+	mu       sync.Mutex
 
-	// conn is the Conn that is being negotiated. It should only be
-	// accessed from background goroutine to avoid concurrent access.
 	conn *Conn
 
 	// Listener is the parent Listener that received the offer signal via NotifySignal.
@@ -256,91 +252,74 @@ type listenerNegotiator struct {
 // If the channel buffer is full (more than 32 signals) or the negotiator is no longer in use, it will
 // return false. The resulting value should be returned from [Listener.NotifySignal].
 func (n *listenerNegotiator) enqueueSignal(signal *Signal) bool {
-	n.closeMu.Lock()
-	defer n.closeMu.Unlock()
+	switch signal.Type {
+	case SignalTypeCandidate, SignalTypeError:
+		n.mu.Lock()
+		if conn := n.conn; conn != nil {
+			n.mu.Unlock()
+			// Signals with those types are typically non-blocking to handle, and therefore
+			// it is safe to call this in the Listener goroutine calling this method.
+			//
+			// As a note, AddRemoteCandidate is a non-blocking method which invokes every
+			// method in the ICE agent in a goroutine.
+			if err := conn.handleSignal(signal); err != nil {
+				conn.log.Error("error handling signal", "error", err)
+				n.reportError(err)
+				return false
+			}
+			return true
+		}
 
-	select {
-	case <-n.closed:
-		return false
-	default:
-	}
-
-	select {
-	case n.signals <- signal:
+		if len(n.deferred) >= 32 {
+			n.mu.Unlock()
+			n.log().Error("could not defer signal", "signal", signal, "networkID", signal.NetworkID, "connectionID", signal.ConnectionID)
+			return false
+		}
+		n.deferred = append(n.deferred, signal)
+		n.mu.Unlock()
 		return true
 	default:
+		n.log().Error("unexpected signal type", "signal", signal, "connectionID", signal.ConnectionID, "networkID", signal.NetworkID)
 		return false
 	}
 }
 
-// background goes as a background goroutine for the negotiator.
-func (n *listenerNegotiator) background() {
-	for {
-		select {
-		case <-n.closed:
-			return
-		case signal, ok := <-n.signals:
-			if !ok {
-				return
-			}
-			var err error
-			switch signal.Type {
-			case SignalTypeOffer:
-				err = n.handleOffer(signal)
-			default:
-				err = n.handleSignal(signal)
-			}
-			if err != nil {
-				var s *signalError
-				if errors.As(err, &s) {
-					if err := n.signaling.Signal(n.Context(), &Signal{
-						Type:         SignalTypeError,
-						ConnectionID: signal.ConnectionID,
-						Data:         strconv.FormatUint(uint64(s.code), 10),
-						NetworkID:    signal.NetworkID,
-					}); err != nil {
-						n.conf.Log.Error("error signaling error", slog.Any("error", err))
-					}
-				}
-				n.conf.Log.Error("error handling signal", slog.Any("signal", signal), slog.Any("error", err))
+func (n *listenerNegotiator) negotiate(offer *Signal) {
+	defer func() { <-n.sem }()
+	if err := n.handleOffer(offer); err != nil {
+		n.close()
+		n.log().Error("error handling offer", "error", err)
+		n.reportError(err)
+		return
+	}
+}
 
-				if signal.Type == SignalTypeOffer && n.conn == nil {
-					// We need to manually unregister the negotiator from the Listener here
-					// since Conn was not created and therefore handleClose is never called.
-					n.close()
-					return
-				}
-			}
+func (n *listenerNegotiator) reportError(err error) {
+	var s *signalError
+	if errors.As(err, &s) {
+		if err := n.signaling.Signal(n.Context(), &Signal{
+			Type:         SignalTypeError,
+			ConnectionID: n.key.connectionID,
+			Data:         strconv.FormatUint(uint64(s.code), 10),
+			NetworkID:    n.key.networkID,
+		}); err != nil {
+			n.conf.Log.Error("error signaling error", slog.Any("error", err))
 		}
 	}
 }
 
-// close unregisters the negotiator from the parent Listener and closes the
-// channels so the background goroutine can abort it. It should be called
-// when the negotiation is unrecoverable or the Conn is closed.
 func (n *listenerNegotiator) close() {
-	n.once.Do(func() {
-		n.negotiationsMu.Lock()
-		if existing, ok := n.negotiations[n.key]; ok && existing == n {
-			delete(n.negotiations, n.key)
-		}
-		n.negotiationsMu.Unlock()
-
-		n.closeMu.Lock()
-		close(n.closed)
-		close(n.signals)
-		n.closeMu.Unlock()
-	})
+	n.negotiationsMu.Lock()
+	if existing, ok := n.negotiations[n.key]; ok && existing == n {
+		delete(n.negotiations, n.key)
+	}
+	n.negotiationsMu.Unlock()
 }
 
 // handleOffer handles an incoming Signal of SignalTypeOffer. It parses the data of Signal into [sdp.SessionDescription]
 // and transforms into remote description for later use in negotiation. An answer will be created from local parameters of
 // each transport and signaled back to the remote connection referenced in the offer.
 func (n *listenerNegotiator) handleOffer(signal *Signal) error {
-	if n.conn != nil {
-		return wrapSignalError(errors.New("duplicate offer for same connection"), ErrorCodeIncomingConnectionIgnored)
-	}
-
 	d := &sdp.SessionDescription{}
 	if err := d.UnmarshalString(signal.Data); err != nil {
 		return wrapSignalError(fmt.Errorf("decode offer: %w", err), ErrorCodeFailedToSetRemoteDescription)
@@ -482,8 +461,21 @@ func (n *listenerNegotiator) handleOffer(signal *Signal) error {
 		}
 	}
 
+	n.mu.Lock()
 	n.conn = c
-	go n.handleConn(c, desc, channelsReady)
+	deferred := slices.Clone(n.deferred)
+	clear(n.deferred)
+	n.mu.Unlock()
+
+	for _, deferredSignal := range deferred {
+		if err := c.handleSignal(deferredSignal); err != nil {
+			return fmt.Errorf("handle deferred signal: %w", err)
+		}
+	}
+
+	if err := n.finaliseConn(c, desc, channelsReady); err != nil {
+		return err
+	}
 	established = true
 	return nil
 }
@@ -503,15 +495,6 @@ func (n *listenerNegotiator) answererRole(role webrtc.DTLSRole) webrtc.DTLSRole 
 	}
 }
 
-// handleSignal handles the given Signal received from the remote network in the Conn.
-func (n *listenerNegotiator) handleSignal(signal *Signal) error {
-	if n.conn == nil {
-		// Should not happen as long as we don't accept ICE candidates before offer in Listener.NotifySignal.
-		return fmt.Errorf("attempting to handle non-offer signal before creating a Conn")
-	}
-	return n.conn.handleSignal(signal)
-}
-
 // handleClose deletes the Conn from the Listener, since it is closed and can no longer be negotiated.
 func (n *listenerNegotiator) handleClose(*Conn) {
 	n.close()
@@ -527,7 +510,7 @@ func (n *listenerNegotiator) log() *slog.Logger {
 // handleConn finalises the Conn. Once an ICE candidate for the Conn has been signaled from the remote
 // connection, it starts the transports of the Conn using the remote description and a context.Context]
 // returned from [ListenConfig.ConnContext].
-func (n *listenerNegotiator) handleConn(conn *Conn, d *description, channelsReady <-chan struct{}) {
+func (n *listenerNegotiator) finaliseConn(conn *Conn, d *description, channelsReady <-chan struct{}) error {
 	var (
 		ctx    context.Context
 		parent = n.Context()
@@ -545,55 +528,30 @@ func (n *listenerNegotiator) handleConn(conn *Conn, d *description, channelsRead
 		defer cancel()
 	}
 
-	var err error
-	defer func() {
-		if err != nil {
-			_ = conn.Close() // Stop notifying for the Conn.
-
-			if errors.Is(err, context.DeadlineExceeded) {
-				// ctx is already expired: use a fresh context so the signal has a chance to be delivered.
-				sigCtx, cancel := context.WithTimeout(n.Context(), time.Second*2)
-				defer cancel()
-				if err := n.signaling.Signal(sigCtx, &Signal{
-					Type:         SignalTypeError,
-					ConnectionID: conn.id,
-					Data:         strconv.Itoa(ErrorCodeNegotiationTimeoutWaitingForAccept),
-					NetworkID:    conn.networkID,
-				}); err != nil {
-					conn.log.Error("error signaling timeout", slog.Any("error", err))
-				}
-			}
-			if !errors.Is(err, net.ErrClosed) {
-				conn.log.Error("error starting transports", slog.Any("error", err))
-			}
-		}
-	}()
-
 	select {
 	case <-ctx.Done():
-		err = ctx.Err()
+		return ctx.Err()
 	case <-n.closed:
-		err = net.ErrClosed
+		return net.ErrClosed
 	case <-conn.ctx.Done():
-		err = context.Cause(conn.ctx)
+		return context.Cause(conn.ctx)
 	case <-conn.candidateReceived:
 		conn.log.Debug("received first candidate")
-		if err = n.startTransports(ctx, conn, d, channelsReady); err != nil {
+		if err := n.startTransports(ctx, conn, d, channelsReady); err != nil {
 			conn.log.Error("error starting transports", slog.Any("error", err))
-			return
+			return err
 		}
 
 		select {
 		case <-ctx.Done():
-			err = ctx.Err()
+			return ctx.Err()
 		case <-conn.ctx.Done():
-			err = context.Cause(conn.ctx)
+			return context.Cause(conn.ctx)
 		case <-n.closed:
-			_ = conn.Close()
+			return net.ErrClosed
 		case n.incoming <- conn:
-			// It is now safe to stop notifying for signals since we've already established the connection.
-			n.close()
 		}
+		return nil
 	}
 }
 
@@ -741,14 +699,22 @@ func (l *Listener) NotifySignal(signal *Signal) bool {
 				l.negotiationsMu.Unlock()
 				return false
 			}
+			select {
+			case l.sem <- struct{}{}:
+				break
+			default:
+				l.conf.Log.Error("error allocating negotiation", "max", len(l.sem))
+				l.negotiationsMu.Unlock()
+				return false
+			}
 			n = &listenerNegotiator{
 				key:      key,
-				signals:  make(chan *Signal, 32),
-				closed:   make(chan struct{}),
 				Listener: l,
 			}
 			l.negotiations[key] = n
-			go n.background()
+			go n.negotiate(signal)
+			l.negotiationsMu.Unlock()
+			return true
 		}
 		l.negotiationsMu.Unlock()
 
@@ -805,7 +771,10 @@ func (e *signalError) Unwrap() error { return e.underlying }
 // wrapSignalError returns a signalError that includes the error as its underlying error (which may be
 // unwrapped with [errors.Unwrap]) and the code to be signaled back to the remote connection. It is typically
 // called by methods handling incoming Signals on the Listener.
-func wrapSignalError(err error, code int) *signalError {
+func wrapSignalError(err error, code int) error {
+	if _, ok := errors.AsType[*signalError](err); ok {
+		return err
+	}
 	return &signalError{code: code, underlying: err}
 }
 
