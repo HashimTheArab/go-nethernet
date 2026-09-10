@@ -57,7 +57,10 @@ func TestAcceptedConnHandlesLateErrorSignal(t *testing.T) {
 	client, server := newMemorySignalingPair("client", "server")
 	t.Cleanup(client.close)
 	t.Cleanup(server.close)
-	l, _, serverConn := dialAcceptedListener(t, client, server)
+	signaling := blockedErrorSignaling{Signaling: server, started: make(chan context.Context, maxListenerSignalErrors)}
+	l, _, serverConn := dialAcceptedListener(t, client, signaling)
+	fillListenerErrorReplies(t, l, signaling.started)
+	waitListenerState(t, l, 0, 0, 1)
 	addr := serverConn.RemoteAddr().(*Addr)
 	if !l.NotifySignal(&Signal{
 		Type:         SignalTypeError,

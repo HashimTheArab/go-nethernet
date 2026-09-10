@@ -2,7 +2,6 @@ package nethernet
 
 import (
 	"context"
-	"errors"
 	"io"
 	"log/slog"
 	"strconv"
@@ -111,13 +110,19 @@ func TestListenerProcessesConnectionsIndependently(t *testing.T) {
 
 	// Keep the first connection blocked and fill only its queue. The second
 	// connection continues independently.
+	accepted := make(chan bool, maxPendingSignalsPerNegotiation)
+	for range maxPendingSignalsPerNegotiation {
+		go func() {
+			accepted <- l.NotifySignal(&Signal{
+				Type:         SignalTypeCandidate,
+				ConnectionID: 1,
+				NetworkID:    "remote",
+				Data:         "candidate",
+			})
+		}()
+	}
 	for i := range maxPendingSignalsPerNegotiation {
-		if !l.NotifySignal(&Signal{
-			Type:         SignalTypeCandidate,
-			ConnectionID: 1,
-			NetworkID:    "remote",
-			Data:         "candidate",
-		}) {
+		if !<-accepted {
 			t.Fatalf("NotifySignal(candidate #%d) = false, want true", i)
 		}
 	}
@@ -168,6 +173,20 @@ func TestListenerClosedSignalingDuringListen(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestListenerRejectsUnownedSignal(t *testing.T) {
+	signaling := newBlockingCredentialsSignaling()
+	t.Cleanup(signaling.close)
+	l, err := (ListenConfig{Log: slog.New(slog.NewTextHandler(io.Discard, nil))}).Listen(signaling)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = l.Close() })
+	if l.NotifySignal(&Signal{Type: SignalTypeCandidate, NetworkID: "unknown", ConnectionID: 1, Data: "candidate"}) {
+		t.Fatal("listener claimed a signal without a connection owner")
+	}
+	waitListenerState(t, l, 0, 0, 0)
 }
 
 // cancelOnNotifySignaling cancels signaling while the listener registers itself.
@@ -293,35 +312,28 @@ func TestListenerAcceptReleasesAdmission(t *testing.T) {
 	waitListenerState(t, l, 0, 0, 0)
 }
 
-func TestListenerBoundsErrorWorkers(t *testing.T) {
-	signaling := blockedErrorSignaling{
-		blockingCredentialsSignaling: newBlockingCredentialsSignaling(),
-		started:                      make(chan context.Context, maxListenerSignalWorkers),
-	}
-	t.Cleanup(signaling.close)
+func TestListenerErrorRepliesDoNotBlockNegotiations(t *testing.T) {
+	base := newBlockingCredentialsSignaling()
+	t.Cleanup(base.close)
+	signaling := blockedErrorSignaling{Signaling: base, started: make(chan context.Context, maxListenerSignalErrors)}
 	l, err := (ListenConfig{Log: slog.New(slog.NewTextHandler(io.Discard, nil))}).Listen(signaling)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = l.Close() })
-	for i := range maxListenerSignalWorkers {
-		if !l.NotifySignal(&Signal{Type: SignalTypeOffer, NetworkID: "remote", ConnectionID: uint64(i), Data: "invalid"}) {
-			t.Fatalf("offer %d rejected before worker limit", i)
-		}
+	fillListenerErrorReplies(t, l, signaling.started)
+	if !l.NotifySignal(&Signal{Type: SignalTypeOffer, NetworkID: "remote", ConnectionID: 1, Data: testOffer(t)}) {
+		t.Fatal("blocked error responses prevented a new negotiation")
 	}
-	for range maxListenerSignalWorkers {
-		select {
-		case ctx := <-signaling.started:
-			if _, ok := ctx.Deadline(); !ok {
-				t.Fatal("error delivery has no deadline")
-			}
-		case <-time.After(time.Second):
-			t.Fatal("worker did not attempt to report its error")
-		}
+	waitForCredentialRequest(t, base.started, "offer while error delivery is full")
+	if !l.NotifySignal(&Signal{Type: SignalTypeOffer, NetworkID: "invalid", ConnectionID: maxListenerSignalErrors, Data: "invalid"}) {
+		t.Fatal("full error budget blocked signal processing")
 	}
-	waitListenerState(t, l, 0, maxListenerSignalWorkers, 0)
-	if l.NotifySignal(&Signal{Type: SignalTypeOffer, NetworkID: "remote", ConnectionID: maxListenerSignalWorkers, Data: "invalid"}) {
-		t.Fatal("error responses did not count towards the worker limit")
+	waitListenerState(t, l, 1, 1, 1)
+	select {
+	case <-signaling.started:
+		t.Fatal("error reply exceeded the delivery limit")
+	default:
 	}
 	_ = l.Close()
 	waitListenerState(t, l, 0, 0, 0)
@@ -329,18 +341,38 @@ func TestListenerBoundsErrorWorkers(t *testing.T) {
 
 // blockedErrorSignaling holds error responses until their delivery context ends.
 type blockedErrorSignaling struct {
-	*blockingCredentialsSignaling
+	Signaling
 	started chan context.Context
 }
 
-// Signal observes the delivery context and blocks as a stalled signaling sender would.
+// Signal stalls error replies while forwarding normal negotiation signals.
 func (s blockedErrorSignaling) Signal(ctx context.Context, signal *Signal) error {
 	if signal.Type != SignalTypeError {
-		return errors.New("unexpected non-error signal")
+		return s.Signaling.Signal(ctx, signal)
 	}
 	s.started <- ctx
 	<-ctx.Done()
 	return ctx.Err()
+}
+
+// fillListenerErrorReplies occupies the error budget with malformed offers.
+func fillListenerErrorReplies(t *testing.T, l *Listener, started <-chan context.Context) {
+	t.Helper()
+	for i := range maxListenerSignalErrors {
+		if !l.NotifySignal(&Signal{Type: SignalTypeOffer, NetworkID: "invalid", ConnectionID: uint64(i), Data: "invalid"}) {
+			t.Fatalf("offer %d rejected before error limit", i)
+		}
+	}
+	for range maxListenerSignalErrors {
+		select {
+		case ctx := <-started:
+			if _, ok := ctx.Deadline(); !ok {
+				t.Fatal("error delivery has no deadline")
+			}
+		case <-time.After(time.Second):
+			t.Fatal("worker did not attempt to report its error")
+		}
+	}
 }
 
 // waitListenerState waits for asynchronous workers to reach the expected ownership state.

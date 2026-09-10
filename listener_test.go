@@ -1,10 +1,29 @@
 package nethernet
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"log/slog"
+	"strings"
 	"testing"
 )
+
+func TestListenerHandleConnPreservesFailureCause(t *testing.T) {
+	var output bytes.Buffer
+	ctx, cancel := context.WithCancelCause(context.Background())
+	want := errors.New("remote negotiation failed")
+	cancel(want)
+	conn := &Conn{ctx: ctx, log: slog.New(slog.NewTextHandler(&output, nil))}
+	// Model a Conn whose transports have already completed closure.
+	conn.once.Do(func() {})
+	n := &listenerNegotiator{Listener: &Listener{}, closed: make(chan struct{})}
+	close(n.closed)
+	n.handleConn(conn, nil, make(chan struct{}))
+	if !strings.Contains(output.String(), want.Error()) {
+		t.Fatalf("failure log = %q, want original connection cause", output.String())
+	}
+}
 
 func TestListenerWaitForChannelsReadyReturnsConnCause(t *testing.T) {
 	n := &listenerNegotiator{closed: make(chan struct{})}
@@ -14,6 +33,7 @@ func TestListenerWaitForChannelsReadyReturnsConnCause(t *testing.T) {
 
 	want := errors.New("connection closed early")
 	cancel(want)
+	close(n.closed)
 
 	err := n.waitForChannelsReady(ctx, conn, make(chan struct{}))
 	if !errors.Is(err, want) {
