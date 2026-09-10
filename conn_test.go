@@ -3,12 +3,46 @@ package nethernet
 import (
 	"context"
 	"errors"
+	"io"
+	"log/slog"
 	"net"
+	"strconv"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/pion/sdp/v3"
 	"github.com/pion/webrtc/v4"
 )
+
+func TestRemoteErrorDoesNotWaitForTransportTeardown(t *testing.T) {
+	ctx, cancel := context.WithCancelCause(context.Background())
+	defer cancel(nil)
+	conn := &Conn{ctx: ctx, cancel: cancel, log: slog.New(slog.NewTextHandler(io.Discard, nil))}
+	started, release := make(chan struct{}), make(chan struct{})
+	defer close(release)
+	// Hold the existing close operation at transport teardown.
+	go conn.once.Do(func() {
+		close(started)
+		<-release
+	})
+	<-started
+	done := make(chan error, 1)
+	go func() {
+		done <- conn.handleSignal(&Signal{Type: SignalTypeError, Data: strconv.Itoa(ErrorCodeGenericFailure)})
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("remote error blocked on transport teardown")
+	}
+	if cause := context.Cause(ctx); cause == nil || !strings.Contains(cause.Error(), "remote peer notified connection failure") {
+		t.Fatalf("connection cause = %v, want immediate remote failure", cause)
+	}
+}
 
 func TestClosedWriteError(t *testing.T) {
 	t.Run("preserves cause", func(t *testing.T) {

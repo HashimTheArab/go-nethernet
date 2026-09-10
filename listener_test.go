@@ -1,13 +1,11 @@
 package nethernet
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
-	"strings"
 	"testing"
 	"time"
 )
@@ -46,7 +44,7 @@ func TestListenerTimeoutReplyUsesConnContext(t *testing.T) {
 			conn.once.Do(func() {})
 			n := &listenerNegotiator{Listener: l, closed: make(chan struct{})}
 			close(n.closed)
-			n.handleConn(conn, nil, make(chan struct{}))
+			n.finaliseConn(conn, nil, make(chan struct{}))
 			// Delivery stays blocked, so any dispatched reply still owns its slot.
 			if got := len(l.errorSlots) != 0; got != test.expired {
 				t.Fatalf("timeout reply dispatched = %v, want %v", got, test.expired)
@@ -55,19 +53,15 @@ func TestListenerTimeoutReplyUsesConnContext(t *testing.T) {
 	}
 }
 
-func TestListenerHandleConnPreservesFailureCause(t *testing.T) {
-	var output bytes.Buffer
+func TestListenerFinaliseConnPreservesFailureCause(t *testing.T) {
 	ctx, cancel := context.WithCancelCause(context.Background())
 	want := errors.New("remote negotiation failed")
 	cancel(want)
-	conn := &Conn{ctx: ctx, log: slog.New(slog.NewTextHandler(&output, nil))}
-	// Model a Conn whose transports have already completed closure.
-	conn.once.Do(func() {})
+	conn := &Conn{ctx: ctx}
 	n := &listenerNegotiator{Listener: &Listener{}, closed: make(chan struct{})}
 	close(n.closed)
-	n.handleConn(conn, nil, make(chan struct{}))
-	if !strings.Contains(output.String(), want.Error()) {
-		t.Fatalf("failure log = %q, want original connection cause", output.String())
+	if err := n.finaliseConn(conn, nil, make(chan struct{})); !errors.Is(err, want) {
+		t.Fatalf("finaliseConn() error = %v, want %v", err, want)
 	}
 }
 

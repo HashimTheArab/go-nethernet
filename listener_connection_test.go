@@ -40,7 +40,7 @@ func TestListenerRejectsDuplicateAfterAccept(t *testing.T) {
 			NetworkID:    addr.NetworkID,
 			Data:         testOffer(t),
 		}) {
-			t.Fatal("NotifySignal(duplicate offer) = false, want queued for rejection")
+			t.Fatal("NotifySignal(duplicate offer) = false, want handled as a rejection")
 		}
 		response := waitListenerResponse(t, responses)
 		if response.Type != SignalTypeError {
@@ -60,7 +60,7 @@ func TestAcceptedConnHandlesLateErrorSignal(t *testing.T) {
 	signaling := blockedErrorSignaling{Signaling: server, started: make(chan context.Context, maxListenerSignalErrors)}
 	l, _, serverConn := dialAcceptedListener(t, client, signaling)
 	fillListenerErrorReplies(t, l, signaling.started)
-	waitListenerState(t, l, 0, 0, 1)
+	waitListenerState(t, l, 0, 1)
 	addr := serverConn.RemoteAddr().(*Addr)
 	if !l.NotifySignal(&Signal{
 		Type:         SignalTypeError,

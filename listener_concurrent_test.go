@@ -4,12 +4,72 @@ import (
 	"context"
 	"io"
 	"log/slog"
+	"net"
 	"strconv"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/pion/webrtc/v4"
 )
+
+func TestListenerNonTrickleGatheringDoesNotBlockOtherOffers(t *testing.T) {
+	stun, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = stun.Close() })
+	base := newBlockingCredentialsSignaling()
+	t.Cleanup(base.close)
+	responses := make(chan Signal, 4)
+	signaling := &firstOfferSTUNSignaling{Signaling: listenerResponseSignaling{base, responses}, url: "stun:" + stun.LocalAddr().String()}
+	var settings webrtc.SettingEngine
+	settings.SetIncludeLoopbackCandidate(true)
+	settings.SetSTUNGatherTimeout(time.Minute)
+	l, err := (ListenConfig{
+		API:               webrtc.NewAPI(webrtc.WithSettingEngine(settings)),
+		Log:               slog.New(slog.NewTextHandler(io.Discard, nil)),
+		AllowAnonymous:    true,
+		DisableTrickleICE: true,
+	}).Listen(signaling)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = l.Close() })
+	offer := testOffer(t)
+	if !l.NotifySignal(&Signal{Type: SignalTypeOffer, NetworkID: "remote", ConnectionID: 1, Data: offer}) {
+		t.Fatal("first offer rejected")
+	}
+	// Receipt of a STUN request proves the first offer entered ICE gathering.
+	// Leave it unanswered while a second offer gathers only local candidates.
+	if err := stun.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := stun.ReadFrom(make([]byte, 1500)); err != nil {
+		t.Fatalf("first offer did not start gathering: %v", err)
+	}
+	if !l.NotifySignal(&Signal{Type: SignalTypeOffer, NetworkID: "remote", ConnectionID: 2, Data: offer}) {
+		t.Fatal("second offer rejected during ICE gathering")
+	}
+	if response := waitListenerResponse(t, responses); response.Type != SignalTypeAnswer || response.ConnectionID != 2 {
+		t.Fatalf("response = %s, want second offer answered while first is gathering", response.String())
+	}
+}
+
+// firstOfferSTUNSignaling supplies a STUN server only to the first offer.
+type firstOfferSTUNSignaling struct {
+	Signaling
+	url   string
+	calls atomic.Uint32
+}
+
+// Credentials makes the first offer wait for STUN while later offers gather locally.
+func (s *firstOfferSTUNSignaling) Credentials(context.Context) (*Credentials, error) {
+	if s.calls.Add(1) == 1 {
+		return &Credentials{ICEServers: []ICEServer{{URLs: []string{s.url}}}}, nil
+	}
+	return nil, nil
+}
 
 // blockingCredentialsSignaling lets tests pause offer handling inside
 // Signaling.Credentials.
@@ -186,7 +246,7 @@ func TestListenerRejectsUnownedSignal(t *testing.T) {
 	if l.NotifySignal(&Signal{Type: SignalTypeCandidate, NetworkID: "unknown", ConnectionID: 1, Data: "candidate"}) {
 		t.Fatal("listener claimed a signal without a connection owner")
 	}
-	waitListenerState(t, l, 0, 0, 0)
+	waitListenerState(t, l, 0, 0)
 }
 
 // cancelOnNotifySignaling cancels signaling while the listener registers itself.
@@ -229,23 +289,23 @@ func TestListenerBoundsPendingNegotiations(t *testing.T) {
 	if l.NotifySignal(next) {
 		t.Fatal("offer above the pending negotiation limit was admitted")
 	}
-	// Existing workers can still receive signals when admission is full.
+	// Pending connections can still receive signals when admission is full.
 	if !l.NotifySignal(&Signal{Type: SignalTypeCandidate, NetworkID: "remote", ConnectionID: 0, Data: "candidate"}) {
 		t.Fatal("pending negotiation could not receive a candidate at capacity")
 	}
 	(<-cancels)()
-	waitListenerState(t, l, maxListenerNegotiations-1, maxListenerNegotiations-1, maxListenerNegotiations-1)
+	waitListenerState(t, l, maxListenerNegotiations-1, maxListenerNegotiations-1)
 	if !l.NotifySignal(next) {
 		t.Fatal("failed negotiation did not release its admission slot")
 	}
 	_ = l.Close()
-	waitListenerState(t, l, 0, 0, 0)
+	waitListenerState(t, l, 0, 0)
 	if l.NotifySignal(next) {
 		t.Fatal("closed listener admitted an offer")
 	}
 }
 
-func TestListenerPendingOwnerSurvivesIdleWorkerAndDuplicate(t *testing.T) {
+func TestListenerPendingOwnerHandlesDirectSignalsAndDuplicates(t *testing.T) {
 	signaling := newBlockingCredentialsSignaling()
 	close(signaling.release)
 	t.Cleanup(signaling.close)
@@ -277,29 +337,29 @@ func TestListenerPendingOwnerSurvivesIdleWorkerAndDuplicate(t *testing.T) {
 	if got := waitListenerResponse(t, responses); got.Type != SignalTypeAnswer {
 		t.Fatalf("initial response = %s, want answer", got.Type)
 	}
-	waitListenerState(t, l, 1, 0, 1)
+	waitListenerState(t, l, 1, 1)
 	if !l.NotifySignal(offer) {
-		t.Fatal("duplicate offer was not queued for rejection")
+		t.Fatal("duplicate offer was not handled as a rejection")
 	}
 	if got := waitListenerResponse(t, responses); got.Type != SignalTypeError || got.Data != strconv.Itoa(ErrorCodeIncomingConnectionIgnored) {
 		t.Fatalf("duplicate response = %s, want incoming connection ignored", got.String())
 	}
-	waitListenerState(t, l, 1, 0, 1)
+	waitListenerState(t, l, 1, 1)
 	if conn.Context().Err() != nil {
 		t.Fatal("duplicate offer closed the original pending connection")
 	}
 	if !l.NotifySignal(&Signal{Type: SignalTypeCandidate, ConnectionID: 1, NetworkID: "remote", Data: "candidate:1 1 udp 2130706431 127.0.0.1 9 typ host"}) {
-		t.Fatal("late candidate was rejected after the worker became idle")
+		t.Fatal("candidate was rejected after Conn publication")
 	}
 	select {
 	case <-conn.candidateReceived:
-	case <-time.After(time.Second):
-		t.Fatal("restarted worker did not deliver the late candidate")
+	default:
+		t.Fatal("NotifySignal returned before delivering the candidate")
 	}
 	if !l.NotifySignal(&Signal{Type: SignalTypeError, ConnectionID: 1, NetworkID: "remote", Data: strconv.Itoa(ErrorCodeGenericFailure)}) {
 		t.Fatal("remote error was rejected")
 	}
-	waitListenerState(t, l, 0, 0, 0)
+	waitListenerState(t, l, 0, 0)
 }
 
 func TestListenerAcceptReleasesAdmission(t *testing.T) {
@@ -307,9 +367,9 @@ func TestListenerAcceptReleasesAdmission(t *testing.T) {
 	t.Cleanup(client.close)
 	t.Cleanup(server.close)
 	l, _, conn := dialAcceptedListener(t, client, server)
-	waitListenerState(t, l, 0, 0, 1)
+	waitListenerState(t, l, 0, 1)
 	_ = conn.Close()
-	waitListenerState(t, l, 0, 0, 0)
+	waitListenerState(t, l, 0, 0)
 }
 
 func TestListenerErrorRepliesDoNotBlockNegotiations(t *testing.T) {
@@ -324,7 +384,7 @@ func TestListenerErrorRepliesDoNotBlockNegotiations(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = l.Close() })
 	fillListenerErrorReplies(t, l, signaling.started)
-	waitListenerState(t, l, 0, 0, 0)
+	waitListenerState(t, l, 0, 0)
 	if !l.NotifySignal(&Signal{Type: SignalTypeOffer, NetworkID: "remote", ConnectionID: 1, Data: testOffer(t)}) {
 		t.Fatal("blocked error responses prevented a new negotiation")
 	}
@@ -332,14 +392,14 @@ func TestListenerErrorRepliesDoNotBlockNegotiations(t *testing.T) {
 	if !l.NotifySignal(&Signal{Type: SignalTypeOffer, NetworkID: "invalid", ConnectionID: maxListenerSignalErrors, Data: "invalid"}) {
 		t.Fatal("full error budget blocked signal processing")
 	}
-	waitListenerState(t, l, 1, 1, 1)
+	waitListenerState(t, l, 1, 1)
 	select {
 	case <-signaling.started:
 		t.Fatal("error reply exceeded the delivery limit")
 	default:
 	}
 	_ = l.Close()
-	waitListenerState(t, l, 0, 0, 0)
+	waitListenerState(t, l, 0, 0)
 }
 
 // blockedErrorSignaling holds error responses until their delivery context ends,
@@ -384,8 +444,8 @@ func fillListenerErrorReplies(t *testing.T, l *Listener, started <-chan context.
 	}
 }
 
-// waitListenerState waits for asynchronous workers to reach the expected ownership state.
-func waitListenerState(t *testing.T, l *Listener, pending, workers, owners int) {
+// waitListenerState waits for offers to reach the expected admission and ownership state.
+func waitListenerState(t *testing.T, l *Listener, pending, owners int) {
 	t.Helper()
 	timeout := time.NewTimer(5 * time.Second)
 	defer timeout.Stop()
@@ -393,14 +453,14 @@ func waitListenerState(t *testing.T, l *Listener, pending, workers, owners int) 
 	defer tick.Stop()
 	for {
 		l.negotiationsMu.Lock()
-		gotPending, gotWorkers, gotOwners := l.pending, l.workers, len(l.negotiations)
+		gotPending, gotOwners := len(l.sem), len(l.negotiations)
 		l.negotiationsMu.Unlock()
-		if gotPending == pending && gotWorkers == workers && gotOwners == owners {
+		if gotPending == pending && gotOwners == owners {
 			return
 		}
 		select {
 		case <-timeout.C:
-			t.Fatalf("listener state = (%d pending, %d workers, %d owners), want (%d, %d, %d)", gotPending, gotWorkers, gotOwners, pending, workers, owners)
+			t.Fatalf("listener state = (%d pending, %d owners), want (%d, %d)", gotPending, gotOwners, pending, owners)
 		case <-tick.C:
 		}
 	}
