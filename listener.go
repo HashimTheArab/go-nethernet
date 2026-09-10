@@ -307,7 +307,10 @@ func (n *listenerNegotiator) negotiate(offer *Signal) {
 	defer func() { <-n.sem }()
 	if err := n.handleOffer(offer); err != nil {
 		n.close()
-		n.log().Error("error handling offer", "error", err)
+		if errors.Is(err, net.ErrClosed) {
+			return
+		}
+		n.log().Error("error handling offer", "error", err, "networkID", n.key.networkID, "connectionID", n.key.connectionID)
 		n.reportError(err)
 		return
 	}
