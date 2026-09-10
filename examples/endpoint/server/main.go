@@ -49,8 +49,6 @@ func main() {
 		os.Exit(1)
 	}
 
-	certFile, keyFile = "", ""
-
 	server := endpoint.NewHandler()
 	l, err := nethernet.ListenConfig{
 		// The example client does not send an identity assertion, so this
