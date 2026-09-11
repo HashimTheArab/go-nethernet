@@ -373,31 +373,29 @@ func TestListenerAcceptReleasesAdmission(t *testing.T) {
 }
 
 func TestListenerErrorRepliesDoNotBlockNegotiations(t *testing.T) {
+	const stalled = 8
 	base := newBlockingCredentialsSignaling()
 	t.Cleanup(base.close)
 	release := make(chan struct{})
 	t.Cleanup(func() { close(release) })
-	signaling := blockedErrorSignaling{Signaling: base, started: make(chan context.Context, maxListenerSignalErrors), release: release}
+	signaling := blockedErrorSignaling{Signaling: base, started: make(chan context.Context, stalled+1), release: release}
 	l, err := (ListenConfig{Log: slog.New(slog.NewTextHandler(io.Discard, nil))}).Listen(signaling)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = l.Close() })
-	fillListenerErrorReplies(t, l, signaling.started)
+	stallListenerErrorReplies(t, l, signaling.started, stalled)
 	waitListenerState(t, l, 0, 0)
 	if !l.NotifySignal(&Signal{Type: SignalTypeOffer, NetworkID: "remote", ConnectionID: 1, Data: testOffer(t)}) {
-		t.Fatal("blocked error responses prevented a new negotiation")
+		t.Fatal("stalled error replies prevented a new negotiation")
 	}
-	waitForCredentialRequest(t, base.started, "offer while error delivery is full")
-	if !l.NotifySignal(&Signal{Type: SignalTypeOffer, NetworkID: "invalid", ConnectionID: maxListenerSignalErrors, Data: "invalid"}) {
-		t.Fatal("full error budget blocked signal processing")
+	waitForCredentialRequest(t, base.started, "offer while error replies stall")
+	if !l.NotifySignal(&Signal{Type: SignalTypeOffer, NetworkID: "invalid", ConnectionID: stalled, Data: "invalid"}) {
+		t.Fatal("stalled error replies blocked signal processing")
 	}
 	waitListenerState(t, l, 1, 1)
-	select {
-	case <-signaling.started:
-		t.Fatal("error reply exceeded the delivery limit")
-	default:
-	}
+	// Replies are never dropped: the new failure reports even while earlier replies stall.
+	waitListenerErrorReply(t, signaling.started)
 	_ = l.Close()
 	waitListenerState(t, l, 0, 0)
 }
@@ -424,23 +422,29 @@ func (s blockedErrorSignaling) Signal(ctx context.Context, signal *Signal) error
 	return ctx.Err()
 }
 
-// fillListenerErrorReplies occupies the error budget with malformed offers.
-func fillListenerErrorReplies(t *testing.T, l *Listener, started <-chan context.Context) {
+// stallListenerErrorReplies leaves n error replies in flight using malformed offers.
+func stallListenerErrorReplies(t *testing.T, l *Listener, started <-chan context.Context, n int) {
 	t.Helper()
-	for i := range maxListenerSignalErrors {
+	for i := range n {
 		if !l.NotifySignal(&Signal{Type: SignalTypeOffer, NetworkID: "invalid", ConnectionID: uint64(i), Data: "invalid"}) {
-			t.Fatalf("offer %d rejected before error limit", i)
+			t.Fatalf("malformed offer %d was rejected", i)
 		}
 	}
-	for range maxListenerSignalErrors {
-		select {
-		case ctx := <-started:
-			if _, ok := ctx.Deadline(); !ok {
-				t.Fatal("error delivery has no deadline")
-			}
-		case <-time.After(time.Second):
-			t.Fatal("worker did not attempt to report its error")
+	for range n {
+		waitListenerErrorReply(t, started)
+	}
+}
+
+// waitListenerErrorReply waits for one error reply to start and checks that its delivery is bounded.
+func waitListenerErrorReply(t *testing.T, started <-chan context.Context) {
+	t.Helper()
+	select {
+	case ctx := <-started:
+		if _, ok := ctx.Deadline(); !ok {
+			t.Fatal("error delivery has no deadline")
 		}
+	case <-time.After(time.Second):
+		t.Fatal("error reply was not attempted")
 	}
 }
 

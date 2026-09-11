@@ -174,7 +174,6 @@ func (conf ListenConfig) Listen(signaling Signaling) (*Listener, error) {
 		incoming:     make(chan *Conn),
 		negotiations: make(map[negotiationKey]*listenerNegotiator),
 		sem:          make(chan struct{}, maxListenerNegotiations),
-		errorSlots:   make(chan struct{}, maxListenerSignalErrors),
 
 		closed: make(chan struct{}),
 	}
@@ -203,8 +202,6 @@ type Listener struct {
 	// negotiationsMu guards negotiations from concurrent read/write access.
 	negotiationsMu sync.RWMutex
 	sem            chan struct{}
-	// errorSlots bounds best-effort replies without occupying offer goroutines.
-	errorSlots chan struct{}
 
 	// stop is a function called to stop notifying signals from [Signaling].
 	stop func()
@@ -246,8 +243,6 @@ type listenerNegotiator struct {
 const (
 	// maxListenerNegotiations bounds offer goroutines through acceptance or failure.
 	maxListenerNegotiations = 64
-	// maxListenerSignalErrors bounds best-effort error replies independently of offers.
-	maxListenerSignalErrors = 64
 	// maxPendingSignalsPerNegotiation bounds signals received before Conn publication.
 	maxPendingSignalsPerNegotiation = 32
 )
@@ -769,15 +764,9 @@ func (l *Listener) NotifySignal(signal *Signal) bool {
 	}
 }
 
-// signalError sends a best-effort error reply without holding an offer goroutine.
-// When its separate delivery budget is full, the reply is dropped. The listener
-// can still process signals and offers while replies stall.
+// signalError sends an error reply asynchronously so slow signaling never stalls
+// NotifySignal or holds a negotiation slot; it is abandoned after [SignalErrorTimeout].
 func (l *Listener) signalError(signal *Signal, code int) {
-	select {
-	case l.errorSlots <- struct{}{}:
-	default:
-		return
-	}
 	response := &Signal{
 		Type:         SignalTypeError,
 		ConnectionID: signal.ConnectionID,
@@ -785,9 +774,8 @@ func (l *Listener) signalError(signal *Signal, code int) {
 		Data:         strconv.Itoa(code),
 	}
 	go func() {
-		defer func() { <-l.errorSlots }()
 		// The connection may already have closed; use the listener's lifetime.
-		ctx, cancel := context.WithTimeout(l.Context(), 2*time.Second)
+		ctx, cancel := context.WithTimeout(l.Context(), SignalErrorTimeout)
 		defer cancel()
 		if err := l.signaling.Signal(ctx, response); err != nil {
 			l.conf.Log.Error("error signaling error", slog.Any("error", err))
