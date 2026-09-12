@@ -268,10 +268,6 @@ func (n *listenerNegotiator) handleSignal(signal *Signal) bool {
 		// close the original peer. Reject it without sending a connection error.
 		return false
 	case SignalTypeError:
-		if _, err := strconv.ParseUint(signal.Data, 10, 32); err != nil {
-			n.log().Error("error parsing remote error code", "error", err)
-			return false
-		}
 		n.mu.Lock()
 		n.remoteCanceled.Store(true)
 		conn := n.conn
@@ -307,7 +303,7 @@ func (n *listenerNegotiator) handleSignal(signal *Signal) bool {
 
 		if len(n.deferred) >= maxPendingSignalsPerNegotiation {
 			n.mu.Unlock()
-			n.log().Error("could not defer signal", "signal", signal, "networkID", signal.NetworkID, "connectionID", signal.ConnectionID)
+			n.log().Error("could not defer signal")
 			return false
 		}
 		n.deferred = append(n.deferred, signal)
@@ -600,7 +596,11 @@ func (n *listenerNegotiator) handleClose(*Conn) {
 // value "listener" to mark that the Conn has been negotiated by Listener, and returns it to be used as the logger
 // of a Conn.
 func (n *listenerNegotiator) log() *slog.Logger {
-	return n.conf.Log.With(slog.String("src", "listener"))
+	return n.conf.Log.With(
+		slog.String("src", "listener"),
+		slog.String("networkID", n.key.networkID),
+		slog.Uint64("connectionID", n.key.connectionID),
+	)
 }
 
 // finaliseConn finalises the Conn. Once an ICE candidate for the Conn has been signaled from the remote

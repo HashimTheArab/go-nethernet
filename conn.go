@@ -408,6 +408,12 @@ func (conn *Conn) handleTransports() {
 //
 // If the Signal is of SignalTypeError, it closes the Conn immediately.
 func (conn *Conn) handleSignal(signal *Signal) error {
+	select {
+	case <-conn.Context().Done():
+		return context.Cause(conn.Context())
+	default:
+	}
+
 	switch signal.Type {
 	case SignalTypeCandidate:
 		candidate, err := parseRemoteCandidate(signal.Data)
@@ -420,7 +426,11 @@ func (conn *Conn) handleSignal(signal *Signal) error {
 	case SignalTypeError:
 		code, err := strconv.ParseUint(signal.Data, 10, 32)
 		if err != nil {
-			return fmt.Errorf("parse error code: %w", err)
+			e := fmt.Errorf("parse error code: %w", err)
+			if err := conn.close(fmt.Errorf("nethernet: remote peer notified connection failure (invalid code: %q)", signal.Data)); err != nil {
+				e = errors.Join(fmt.Errorf("close: %w", err), e)
+			}
+			return e
 		}
 		if err := conn.close(fmt.Errorf("nethernet: remote peer notified connection failure (code: %d)", code)); err != nil {
 			return fmt.Errorf("close: %w", err)
