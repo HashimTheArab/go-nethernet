@@ -632,8 +632,11 @@ func (n *listenerNegotiator) finaliseConn(conn *Conn, d *description, channelsRe
 
 	defer func() {
 		if err != nil {
-			if cause := context.Cause(conn.ctx); cause != nil {
-				err = cause
+			switch err {
+			case context.Canceled, context.DeadlineExceeded, net.ErrClosed:
+				if cause := context.Cause(conn.ctx); cause != nil {
+					err = cause
+				}
 			}
 			if errors.Is(ctx.Err(), context.DeadlineExceeded) {
 				// Report the timeout through negotiate, which owns the error reply.
