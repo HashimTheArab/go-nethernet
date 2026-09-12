@@ -84,6 +84,30 @@ func TestListenerTimeoutReplyUsesConnContext(t *testing.T) {
 	}
 }
 
+func TestFinaliseConnErrorPreservesTransportDetails(t *testing.T) {
+	closedCtx, cancel := context.WithCancelCause(context.Background())
+	cause := errors.New("DTLS transport entered failed state")
+	cancel(cause)
+	for _, failure := range []error{
+		fmt.Errorf("start transports: %w", errors.New("remote fingerprint mismatch")),
+		fmt.Errorf("start transports: %w", context.Canceled),
+		fmt.Errorf("start transports: %w", context.DeadlineExceeded),
+		fmt.Errorf("start transports: %w", net.ErrClosed),
+	} {
+		if got := finaliseConnError(context.Background(), closedCtx, failure); got != failure {
+			t.Errorf("finaliseConnError() = %v, want original error %v", got, failure)
+		}
+	}
+	for _, failure := range []error{context.Canceled, context.DeadlineExceeded, net.ErrClosed} {
+		if got := finaliseConnError(context.Background(), closedCtx, failure); got != cause {
+			t.Errorf("finaliseConnError(%v) = %v, want connection cause %v", failure, got, cause)
+		}
+	}
+	if got := finaliseConnError(context.Background(), closedCtx, nil); got != nil {
+		t.Fatalf("successful finalisation changed to failure: %v", got)
+	}
+}
+
 func TestListenerFinaliseConnPreservesFailureCause(t *testing.T) {
 	ctx, cancel := context.WithCancelCause(context.Background())
 	want := errors.New("remote negotiation failed")

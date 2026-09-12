@@ -15,6 +15,7 @@ type Signaling interface {
 	// Signal sends a Signal to a remote network referenced by [Signal.NetworkID].
 	// The [context.Context] is used to cancel waiting for the acknowledgement from
 	// the signaling server as soon as possible.
+	// Signal may be called concurrently, including for the same connection.
 	Signal(ctx context.Context, signal *Signal) error
 
 	// Notify registers n for receiving incoming signals from remote networks.

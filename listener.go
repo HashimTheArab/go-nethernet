@@ -625,15 +625,7 @@ func (n *listenerNegotiator) finaliseConn(conn *Conn, d *description, channelsRe
 	}
 
 	defer func() {
-		if err != nil {
-			if cause := context.Cause(conn.ctx); cause != nil {
-				err = cause
-			}
-			if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-				// Report the timeout through negotiate, which owns the error reply.
-				err = &signalError{code: ErrorCodeNegotiationTimeoutWaitingForAccept, underlying: err}
-			}
-		}
+		err = finaliseConnError(ctx, conn.ctx, err)
 	}()
 
 	select {
@@ -660,6 +652,25 @@ func (n *listenerNegotiator) finaliseConn(conn *Conn, d *description, channelsRe
 		}
 		return nil
 	}
+}
+
+// finaliseConnError restores the connection cause when a wait returns a generic
+// cancellation error and adds the handshake timeout code when its deadline expired.
+// Concrete transport errors keep their original details and wrapping.
+func finaliseConnError(ctx, connCtx context.Context, err error) error {
+	if err != nil {
+		switch err {
+		case context.Canceled, context.DeadlineExceeded, net.ErrClosed:
+			if cause := context.Cause(connCtx); cause != nil {
+				err = cause
+			}
+		}
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			// Report the timeout through negotiate, which owns the error reply.
+			err = &signalError{code: ErrorCodeNegotiationTimeoutWaitingForAccept, underlying: err}
+		}
+	}
+	return err
 }
 
 // startTransports starts ICE as [webrtc.ICERoleControlled], then starts DTLS
