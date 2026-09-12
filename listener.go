@@ -253,10 +253,10 @@ const (
 	maxPendingSignalsPerNegotiation = 32
 )
 
-// enqueueSignal defers candidates until the offer publishes its Conn.
-// Remote errors cancel pending work and close any published Conn immediately.
-// It returns false for duplicate offers, a full deferred buffer, or a closed owner.
-func (n *listenerNegotiator) enqueueSignal(signal *Signal) bool {
+// handleSignal handles the given Signal received from the remote network.
+// Candidate and error signals are deferred until the Conn is established in the background.
+// Once the Conn is established, it directly calls [Conn.handleSignal].
+func (n *listenerNegotiator) handleSignal(signal *Signal) bool {
 	select {
 	case <-n.closed:
 		return false
@@ -566,7 +566,7 @@ func (n *listenerNegotiator) handleOffer(signal *Signal) error {
 	n.mu.Unlock()
 
 	for _, deferredSignal := range deferred {
-		n.enqueueSignal(deferredSignal)
+		n.handleSignal(deferredSignal)
 	}
 
 	if err := n.finaliseConn(c, desc, channelsReady); err != nil {
@@ -830,7 +830,7 @@ func (l *Listener) NotifySignal(signal *Signal) bool {
 		}
 		l.negotiationsMu.Unlock()
 
-		return n.enqueueSignal(signal)
+		return n.handleSignal(signal)
 	}
 }
 
