@@ -10,7 +10,6 @@ import (
 	"net"
 	"strconv"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -848,41 +847,6 @@ func TestAcceptedConnHandlesLateErrorSignal(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("accepted connection did not close after remote error")
 	}
-}
-
-func TestListenerRemoteErrorDoesNotWaitForTransportCleanup(t *testing.T) {
-	client, server := newMemorySignalingPair("client", "server")
-	t.Cleanup(client.close)
-	t.Cleanup(server.close)
-	l, _, conn := dialAcceptedListener(t, client, server)
-	addr := conn.RemoteAddr().(*Addr)
-	// Hold cleanup at the channel snapshot while the signaling callback runs.
-	conn.channelsMu.Lock()
-	unlock := sync.OnceFunc(conn.channelsMu.Unlock)
-	t.Cleanup(unlock)
-	returned := make(chan bool, 1)
-	go func() {
-		returned <- l.NotifySignal(&Signal{
-			Type: SignalTypeError, NetworkID: addr.NetworkID,
-			ConnectionID: addr.ConnectionID, Data: strconv.Itoa(ErrorCodeGenericFailure),
-		})
-	}()
-	select {
-	case accepted := <-returned:
-		if !accepted {
-			t.Fatal("remote error rejected")
-		}
-	case <-time.After(time.Second):
-		t.Fatal("remote error blocked signaling on transport cleanup")
-	}
-	if cause := context.Cause(conn.ctx); cause == nil || !strings.Contains(cause.Error(), "remote peer notified connection failure") {
-		t.Fatalf("remote error returned before canceling connection: %v", cause)
-	}
-	unlock()
-	if err := conn.Close(); err != nil {
-		t.Fatal(err)
-	}
-	waitListenerState(t, l, 0, 0)
 }
 
 func TestAcceptedConnSurvivesListenerClose(t *testing.T) {

@@ -80,10 +80,8 @@ type Conn struct {
 	readMu  sync.Mutex
 	readBuf []byte
 
-	// once ensures that the Conn transports are closed only once.
+	// once ensures that the Conn is closed only once.
 	once sync.Once
-	// asyncCloseOnce bounds background cleanup to one goroutine per Conn.
-	asyncCloseOnce sync.Once
 
 	log *slog.Logger
 
@@ -96,7 +94,7 @@ type Conn struct {
 	// ctx is the background context associated with the Conn.
 	ctx context.Context
 	// cancel is the function used to cancel the ctx with a cause.
-	// It is called by close and closeAsync; the first cause is preserved.
+	// It is called by close and must not be called elsewhere.
 	cancel context.CancelCauseFunc
 }
 
@@ -334,19 +332,6 @@ func (conn *Conn) close(cause error) (err error) {
 	return err
 }
 
-// closeAsync cancels the connection immediately and closes its transports in the
-// background, so signaling callbacks do not wait for transport cleanup.
-func (conn *Conn) closeAsync(cause error) {
-	conn.cancel(cause)
-	conn.asyncCloseOnce.Do(func() {
-		go func() {
-			if err := conn.close(cause); err != nil {
-				conn.log.Error("error closing conn", slog.Any("error", err))
-			}
-		}()
-	})
-}
-
 // channel returns the dataChannel for the given MessageReliability.
 func (conn *Conn) channel(r MessageReliability) *dataChannel {
 	conn.channelsMu.RLock()
@@ -421,8 +406,7 @@ func (conn *Conn) handleTransports() {
 // If the Signal is of SignalTypeCandidate, it parses a [webrtc.ICECandidate] from its data and
 // adds it to the ICE transport of the Conn.
 //
-// If the Signal is of SignalTypeError, it cancels the Conn immediately and closes
-// its transports in the background.
+// If the Signal is of SignalTypeError, it closes the Conn immediately.
 func (conn *Conn) handleSignal(signal *Signal) error {
 	switch signal.Type {
 	case SignalTypeCandidate:
@@ -438,7 +422,9 @@ func (conn *Conn) handleSignal(signal *Signal) error {
 		if err != nil {
 			return fmt.Errorf("parse error code: %w", err)
 		}
-		conn.closeAsync(fmt.Errorf("nethernet: remote peer notified connection failure (code: %d)", code))
+		if err := conn.close(fmt.Errorf("nethernet: remote peer notified connection failure (code: %d)", code)); err != nil {
+			return fmt.Errorf("close: %w", err)
+		}
 	default:
 		return fmt.Errorf("unknown signal type: %s", signal.Type)
 	}
