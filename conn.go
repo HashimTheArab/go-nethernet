@@ -408,6 +408,12 @@ func (conn *Conn) handleTransports() {
 //
 // If the Signal is of SignalTypeError, it closes the Conn immediately.
 func (conn *Conn) handleSignal(signal *Signal) error {
+	select {
+	case <-conn.Context().Done():
+		return context.Cause(conn.Context())
+	default:
+	}
+
 	switch signal.Type {
 	case SignalTypeCandidate:
 		candidate, err := parseRemoteCandidate(signal.Data)
@@ -418,7 +424,7 @@ func (conn *Conn) handleSignal(signal *Signal) error {
 			return err
 		}
 	case SignalTypeError:
-		code, err := strconv.ParseUint(signal.Data, 10, 32)
+		code, err := parseSignalErrorCode(signal.Data)
 		if err != nil {
 			return fmt.Errorf("parse error code: %w", err)
 		}
@@ -602,7 +608,8 @@ func parseDescription(d *sdp.SessionDescription) (*description, error) {
 // before the offer or answer is encoded so they can be embedded into the SDP.
 //
 // The gather is aborted if ctx is canceled or if conn is closed.
-func (conn *Conn) gatherCandidates(ctx context.Context) (candidates []webrtc.ICECandidate, _ error) {
+func (conn *Conn) gatherCandidates(ctx context.Context) ([]webrtc.ICECandidate, error) {
+	var candidates []webrtc.ICECandidate
 	complete := make(chan struct{})
 	conn.gatherer.OnLocalCandidate(func(candidate *webrtc.ICECandidate) {
 		if candidate == nil {
