@@ -5,7 +5,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"github.com/pion/webrtc/v4"
 	"io"
 	"log/slog"
 	"net"
@@ -14,6 +13,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/pion/webrtc/v4"
 )
 
 func TestListenerTimeoutReplyUsesConnContext(t *testing.T) {
