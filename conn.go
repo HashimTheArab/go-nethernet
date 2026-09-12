@@ -602,7 +602,8 @@ func parseDescription(d *sdp.SessionDescription) (*description, error) {
 // before the offer or answer is encoded so they can be embedded into the SDP.
 //
 // The gather is aborted if ctx is canceled or if conn is closed.
-func (conn *Conn) gatherCandidates(ctx context.Context) (candidates []webrtc.ICECandidate, _ error) {
+func (conn *Conn) gatherCandidates(ctx context.Context) ([]webrtc.ICECandidate, error) {
+	var candidates []webrtc.ICECandidate
 	complete := make(chan struct{})
 	conn.gatherer.OnLocalCandidate(func(candidate *webrtc.ICECandidate) {
 		if candidate == nil {
