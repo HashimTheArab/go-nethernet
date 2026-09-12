@@ -23,8 +23,6 @@ import (
 
 // ListenConfig encapsulates options for creating a new Listener through [ListenConfig.Listen].
 // It allows customizing logging, WebRTC API settings, and contexts for negotiations.
-// Its callbacks may run concurrently for different connections and must synchronize
-// access to any shared mutable state.
 type ListenConfig struct {
 	// Log is used for logging messages at various levels. If nil, the default [slog.Logger] will be set from
 	// [slog.Default]. Log will be extended when a Conn is being accepted by [Listener.Accept] with additional
@@ -40,12 +38,16 @@ type ListenConfig struct {
 	// ConnContext provides a [context.Context] for starting the ICE, DTLS, and SCTP transports of the Conn. If nil,
 	// a default [context.Context] with 5 seconds timeout will be used. The parent [context.Context] may be used to
 	// create a [context.Context] to be returned (likely using [context.WithCancel] or [context.WithTimeout]).
+	//
+	// It may be called concurrently for different connections.
 	ConnContext func(parent context.Context, conn *Conn) (context.Context, context.CancelFunc)
 
 	// NegotiationContext provides a [context.Context] for the negotiation. If nil, a default [context.Context]
 	// with 5 seconds timeout will be used. The parent [context.Context] may be used to create a [context.Context]
 	// to be returned (likely using [context.WithCancel] or [context.WithTimeout]). If the deadline of the context
 	// is exceeded, a Signal of SignalTypeError with ErrorCodeNegotiationTimeoutWaitingForAccept will be signaled back.
+	//
+	// It may be called concurrently for different connections.
 	NegotiationContext func(parent context.Context) (context.Context, context.CancelFunc)
 
 	// IssueServerIdentity issues the identity presented to clients in SDP answers.
@@ -56,6 +58,8 @@ type ListenConfig struct {
 	// If set to nil, it is replaced to a function that automatically generates a
 	// temporary identity. Because the generated key is not saved, clients using
 	// Trust On First Use (TOFU) may treat each server restart as a different identity.
+	//
+	// It may be called concurrently for different connections.
 	IssueServerIdentity func(ctx context.Context) (*Identity, error)
 
 	// VerifyClientToken verifies the token contained in a client's identity
@@ -86,6 +90,8 @@ type ListenConfig struct {
 	// that the same public key was used in its 'cpk' claim. Servers that rely on
 	// NetherNet identity alone should provide a verifier that validates token
 	// issuance.
+	//
+	// It may be called concurrently for different connections.
 	VerifyClientToken func(ctx context.Context, token string) (*ecdsa.PublicKey, error)
 
 	// AllowAnonymous determines whether SDP offers without an 'a=identity'
