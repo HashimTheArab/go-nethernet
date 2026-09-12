@@ -258,7 +258,7 @@ func (n *listenerNegotiator) enqueueSignal(signal *Signal) bool {
 	}
 	switch signal.Type {
 	case SignalTypeOffer:
-		n.signalError(signal, ErrorCodeIncomingConnectionIgnored)
+		n.signalError(ErrorCodeIncomingConnectionIgnored)
 		return true
 	case SignalTypeCandidate, SignalTypeError:
 		n.mu.Lock()
@@ -302,11 +302,11 @@ func (n *listenerNegotiator) negotiate(offer *Signal) {
 	defer func() { <-n.sem }()
 	if err := n.handleOffer(offer); err != nil {
 		n.close()
+		n.reportError(err)
 		if errors.Is(err, net.ErrClosed) {
 			return
 		}
 		n.log().Error("error handling offer", "error", err, "networkID", n.key.networkID, "connectionID", n.key.connectionID)
-		n.reportError(err)
 		return
 	}
 }
@@ -315,8 +315,27 @@ func (n *listenerNegotiator) negotiate(offer *Signal) {
 func (n *listenerNegotiator) reportError(err error) {
 	var s *signalError
 	if errors.As(err, &s) {
-		n.signalError(&Signal{ConnectionID: n.key.connectionID, NetworkID: n.key.networkID}, s.code)
+		n.signalError(s.code)
 	}
+}
+
+// signalError sends an error reply asynchronously so slow signaling never stalls
+// NotifySignal or holds a negotiation slot; it is abandoned after [SignalErrorTimeout].
+func (n *listenerNegotiator) signalError(code int) {
+	response := &Signal{
+		Type:         SignalTypeError,
+		ConnectionID: n.key.connectionID,
+		NetworkID:    n.key.networkID,
+		Data:         strconv.Itoa(code),
+	}
+	go func() {
+		// The connection may already have closed; use the listener's lifetime.
+		ctx, cancel := context.WithTimeout(n.Listener.Context(), SignalErrorTimeout)
+		defer cancel()
+		if err := n.signaling.Signal(ctx, response); err != nil {
+			n.conf.Log.Error("error signaling error", slog.Any("error", err))
+		}
+	}()
 }
 
 // Context is canceled when this connection owner or its listener closes.
@@ -561,7 +580,8 @@ func (n *listenerNegotiator) finaliseConn(conn *Conn, d *description, channelsRe
 				err = cause
 			}
 			if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-				n.signalError(&Signal{ConnectionID: conn.id, NetworkID: conn.networkID}, ErrorCodeNegotiationTimeoutWaitingForAccept)
+				// Report the timeout through negotiate, which owns the error reply.
+				err = &signalError{code: ErrorCodeNegotiationTimeoutWaitingForAccept, underlying: err}
 			}
 		}
 	}()
@@ -576,7 +596,7 @@ func (n *listenerNegotiator) finaliseConn(conn *Conn, d *description, channelsRe
 	case <-conn.candidateReceived:
 		conn.log.Debug("received first candidate")
 		if err := n.startTransports(ctx, conn, d, channelsReady); err != nil {
-			return err
+			return fmt.Errorf("start transports: %w", err)
 		}
 
 		select {
@@ -762,25 +782,6 @@ func (l *Listener) NotifySignal(signal *Signal) bool {
 
 		return n.enqueueSignal(signal)
 	}
-}
-
-// signalError sends an error reply asynchronously so slow signaling never stalls
-// NotifySignal or holds a negotiation slot; it is abandoned after [SignalErrorTimeout].
-func (l *Listener) signalError(signal *Signal, code int) {
-	response := &Signal{
-		Type:         SignalTypeError,
-		ConnectionID: signal.ConnectionID,
-		NetworkID:    signal.NetworkID,
-		Data:         strconv.Itoa(code),
-	}
-	go func() {
-		// The connection may already have closed; use the listener's lifetime.
-		ctx, cancel := context.WithTimeout(l.Context(), SignalErrorTimeout)
-		defer cancel()
-		if err := l.signaling.Signal(ctx, response); err != nil {
-			l.conf.Log.Error("error signaling error", slog.Any("error", err))
-		}
-	}()
 }
 
 // monitorSignaling closes the listener when its signaling connection ends.
