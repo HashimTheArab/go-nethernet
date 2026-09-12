@@ -74,6 +74,14 @@ type Dialer struct {
 	// as relayed candidates from TURN servers only.
 	ICEGatherPolicy webrtc.ICEGatherPolicy
 
+	// Credentials optionally supplies the ICE servers used for gathering local
+	// candidates. When non-nil, it takes precedence over [Signaling.Credentials],
+	// letting a caller gather through its own STUN/TURN servers rather than the
+	// ones advertised by the signaling service. This pairs with
+	// [Dialer.ICEGatherPolicy] set to relay-only to route the connection through
+	// a caller-controlled TURN server.
+	Credentials func(ctx context.Context) (*Credentials, error)
+
 	// DisableTrickleICE disables trickle ICE for connection negotiation.
 	//
 	// When set to true, the dialer waits for ICE gathering to complete and embeds
@@ -93,6 +101,9 @@ type Dialer struct {
 // an offer with local candidates, and also to notify incoming signals received from the remote network. The
 // [context.Context] may be used to cancel the connection as soon as possible. A Conn may be returned, that is
 // ready to receive and send packets.
+//
+// If the dial fails, a terminal error signal describing the failure may still be sent to the remote network
+// asynchronously; it is abandoned after [SignalErrorTimeout].
 func (d Dialer) DialContext(ctx context.Context, networkID string, signaling Signaling) (_ *Conn, err error) {
 	if d.ConnectionID == 0 {
 		d.ConnectionID = rand.Uint64()
@@ -114,7 +125,11 @@ func (d Dialer) DialContext(ctx context.Context, networkID string, signaling Sig
 		}
 	}
 
-	credentials, err := signaling.Credentials(ctx)
+	credentialsFunc := signaling.Credentials
+	if d.Credentials != nil {
+		credentialsFunc = d.Credentials
+	}
+	credentials, err := credentialsFunc(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("obtain credentials: %w", err)
 	}
@@ -209,23 +224,23 @@ func (d Dialer) DialContext(ctx context.Context, networkID string, signaling Sig
 				if desc.identity != nil {
 					publicKey, err := d.VerifyServerToken(ctx, desc.identity.Assertion.Token, desc.identity.IdentityProvider.Domain)
 					if err != nil {
-						d.signalError(signaling, networkID, ErrorCodeIdentityVerificationFailed)
+						d.signalError(signaling, networkID, ErrorCodeIdentityNotAllowed)
 						return nil, fmt.Errorf("verify server identity token: %w", err)
 					}
 					if publicKey == nil {
 						publicKey, err = claimPublicKey(desc.identity.Assertion.Token, true)
 						if err != nil {
-							d.signalError(signaling, networkID, ErrorCodeIdentityVerificationFailed)
+							d.signalError(signaling, networkID, ErrorCodeIdentityNotAllowed)
 							return nil, fmt.Errorf("claim public key: %w", err)
 						}
 					}
 					if err := desc.identity.verify(desc, publicKey); err != nil {
-						d.signalError(signaling, networkID, ErrorCodeIdentityVerificationFailed)
+						d.signalError(signaling, networkID, ErrorCodeIdentityNotAllowed)
 						return nil, fmt.Errorf("verify server identity: %w", err)
 					}
 					c.publicKey = publicKey
 				} else if !d.AllowIdentitylessServer {
-					d.signalError(signaling, networkID, ErrorCodeIdentityVerificationFailed)
+					d.signalError(signaling, networkID, ErrorCodeIdentityNotAllowed)
 					return nil, errors.New("identityless answer SDP not allowed")
 				}
 				for _, candidate := range desc.candidates {
@@ -295,7 +310,7 @@ func (d dialerConn) log() *slog.Logger {
 // provided [Signaling] implementation, remote network ID, and error code.
 func (d Dialer) signalError(signaling Signaling, networkID string, code int) {
 	go func() {
-		ctx, cancel := context.WithTimeout(signaling.Context(), signalErrorTimeout)
+		ctx, cancel := context.WithTimeout(signaling.Context(), SignalErrorTimeout)
 		defer cancel()
 		_ = signaling.Signal(ctx, &Signal{
 			Type:         SignalTypeError,
@@ -306,7 +321,9 @@ func (d Dialer) signalError(signaling Signaling, networkID string, code int) {
 	}()
 }
 
-const signalErrorTimeout = time.Second * 2
+// SignalErrorTimeout bounds the asynchronous terminal error signal sent to the remote network after a
+// failed dial.
+const SignalErrorTimeout = time.Second * 2
 
 // startTransports starts the ICE transport as [webrtc.ICERoleControlling],
 // then starts DTLS and SCTP using the parameters from the remote description.
@@ -332,12 +349,13 @@ func (d Dialer) startTransports(ctx context.Context, conn *Conn, desc *descripti
 	}); err != nil {
 		return fmt.Errorf("start SCTP: %w", err)
 	}
+	conn.maxSegmentPayload.Store(conn.sctp.GetCapabilities().MaxMessageSize - 1)
 	for r := range messageReliabilityCapacity {
 		c, err := d.API.NewDataChannel(conn.sctp, r.Parameters())
 		if err != nil {
 			return fmt.Errorf("create %s: %w", r.Parameters().Label, err)
 		}
-		if existing := conn.storeChannel(r, wrapDataChannel(c, r, conn)); existing != nil {
+		if existing := conn.storeChannel(r, wrapDataChannel(c, r, conn, nil)); existing != nil {
 			return fmt.Errorf("data channel created for same reliability parameters: %q", r.Parameters().Label)
 		}
 	}
@@ -415,6 +433,11 @@ type dialerNotifier struct {
 // NotifySignal notifies an incoming Signal received from the Signaling implementation.
 func (d *dialerNotifier) NotifySignal(signal *Signal) bool {
 	if signal.ConnectionID != d.ConnectionID || signal.NetworkID != d.networkID {
+		return false
+	}
+	if err := signal.validate(); err != nil {
+		// This can happen when a Signaling implementation builds a Signal itself.
+		d.Log.Error("error validating signal", slog.Any("signal", signal), "error", err)
 		return false
 	}
 	select {
