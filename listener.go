@@ -249,7 +249,7 @@ const (
 
 // enqueueSignal defers candidates and errors until the offer creates its Conn.
 // Once published, the Conn handles signals directly in the notifying goroutine.
-// It returns false when the deferred buffer is full or the owner has closed.
+// It returns false for duplicate offers, a full deferred buffer, or a closed owner.
 func (n *listenerNegotiator) enqueueSignal(signal *Signal) bool {
 	select {
 	case <-n.closed:
@@ -258,8 +258,9 @@ func (n *listenerNegotiator) enqueueSignal(signal *Signal) bool {
 	}
 	switch signal.Type {
 	case SignalTypeOffer:
-		n.signalError(ErrorCodeIncomingConnectionIgnored)
-		return true
+		// A duplicate shares the original connection ID, so an error reply would
+		// close the original peer. Reject it without sending a connection error.
+		return false
 	case SignalTypeCandidate, SignalTypeError:
 		n.mu.Lock()
 		select {

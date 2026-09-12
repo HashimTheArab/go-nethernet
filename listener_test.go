@@ -474,11 +474,13 @@ func TestListenerPendingOwnerHandlesDirectSignalsAndDuplicates(t *testing.T) {
 		t.Fatalf("initial response = %s, want answer", got.Type)
 	}
 	waitListenerState(t, l, 1, 1)
-	if !l.NotifySignal(offer) {
-		t.Fatal("duplicate offer was not handled as a rejection")
+	if l.NotifySignal(offer) {
+		t.Fatal("duplicate offer was admitted")
 	}
-	if got := waitListenerResponse(t, responses); got.Type != SignalTypeError || got.Data != strconv.Itoa(ErrorCodeIncomingConnectionIgnored) {
-		t.Fatalf("duplicate response = %s, want incoming connection ignored", got.String())
+	select {
+	case got := <-responses:
+		t.Fatalf("unexpected reply to duplicate offer: %s", got.String())
+	case <-time.After(100 * time.Millisecond):
 	}
 	waitListenerState(t, l, 1, 1)
 	if conn.Context().Err() != nil {
@@ -681,22 +683,25 @@ func TestListenerRejectsDuplicateAfterAccept(t *testing.T) {
 	}
 	addr := serverConn.RemoteAddr().(*Addr)
 	for range 2 {
-		if !l.NotifySignal(&Signal{
+		admitted := l.NotifySignal(&Signal{
 			Type:         SignalTypeOffer,
 			ConnectionID: addr.ConnectionID,
 			NetworkID:    addr.NetworkID,
 			Data:         testOffer(t),
-		}) {
-			t.Fatal("NotifySignal(duplicate offer) = false, want handled as a rejection")
+		})
+		select {
+		case <-clientConn.Context().Done():
+			t.Fatalf("duplicate offer closed original client: %v", context.Cause(clientConn.ctx))
+		case response := <-responses:
+			t.Fatalf("unexpected reply to duplicate offer: %s", response.String())
+		case <-time.After(100 * time.Millisecond):
 		}
-		response := waitListenerResponse(t, responses)
-		if response.Type != SignalTypeError {
-			t.Fatalf("duplicate response type = %q, want error", response.Type)
+		if admitted {
+			t.Fatal("duplicate offer was admitted")
 		}
-		if response.Data != strconv.Itoa(ErrorCodeIncomingConnectionIgnored) {
-			t.Fatalf("duplicate error code = %q, want incoming connection ignored", response.Data)
-		}
+		waitListenerState(t, l, 0, 1)
 		checkConnPayload(t, clientConn, serverConn, []byte("original connection still works"))
+		checkConnPayload(t, serverConn, clientConn, []byte("original connection still replies"))
 	}
 }
 
@@ -753,14 +758,13 @@ func (s smallMessageSignaling) Signal(ctx context.Context, signal *Signal) error
 	return s.Signaling.Signal(ctx, &copy)
 }
 
-// listenerResponseSignaling records negotiation replies without sending duplicate
-// rejection errors to the already established client with the same connection ID.
+// listenerResponseSignaling records negotiation replies and forwards all signals.
 type listenerResponseSignaling struct {
 	Signaling
 	responses chan<- Signal
 }
 
-// Signal records answers and errors, forwarding everything except error replies.
+// Signal records answers and errors before forwarding them to the remote peer.
 func (s listenerResponseSignaling) Signal(ctx context.Context, signal *Signal) error {
 	if signal.Type == SignalTypeAnswer || signal.Type == SignalTypeError {
 		select {
@@ -768,9 +772,6 @@ func (s listenerResponseSignaling) Signal(ctx context.Context, signal *Signal) e
 		case <-ctx.Done():
 			return ctx.Err()
 		}
-	}
-	if signal.Type == SignalTypeError {
-		return nil
 	}
 	return s.Signaling.Signal(ctx, signal)
 }
