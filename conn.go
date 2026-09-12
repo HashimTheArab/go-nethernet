@@ -82,8 +82,6 @@ type Conn struct {
 
 	// once ensures that the Conn transports are closed only once.
 	once sync.Once
-	// asyncCloseOnce starts at most one background cleanup per Conn.
-	asyncCloseOnce sync.Once
 
 	log *slog.Logger
 
@@ -96,7 +94,7 @@ type Conn struct {
 	// ctx is the background context associated with the Conn.
 	ctx context.Context
 	// cancel is the function used to cancel the ctx with a cause.
-	// It is called by close and closeAsync; the first cause is preserved.
+	// The first cause is preserved.
 	cancel context.CancelCauseFunc
 }
 
@@ -334,19 +332,6 @@ func (conn *Conn) close(cause error) (err error) {
 	return err
 }
 
-// closeAsync cancels the Conn immediately and closes its transports in the background.
-// Signaling callbacks can return without waiting for transport cleanup.
-func (conn *Conn) closeAsync(cause error) {
-	conn.cancel(cause)
-	conn.asyncCloseOnce.Do(func() {
-		go func() {
-			if err := conn.close(cause); err != nil {
-				conn.log.Error("error closing conn", slog.Any("error", err))
-			}
-		}()
-	})
-}
-
 // channel returns the dataChannel for the given MessageReliability.
 func (conn *Conn) channel(r MessageReliability) *dataChannel {
 	conn.channelsMu.RLock()
@@ -444,7 +429,9 @@ func (conn *Conn) handleSignal(signal *Signal) error {
 		if err != nil {
 			return fmt.Errorf("parse error code: %w", err)
 		}
-		conn.closeAsync(fmt.Errorf("nethernet: remote peer notified connection failure (code: %d)", code))
+		cause := fmt.Errorf("nethernet: remote peer notified connection failure (code: %d)", code)
+		conn.cancel(cause)
+		go conn.close(cause)
 	default:
 		return fmt.Errorf("unknown signal type: %s", signal.Type)
 	}
