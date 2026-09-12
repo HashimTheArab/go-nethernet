@@ -137,7 +137,7 @@ func wait[T any](t *testing.T, ch <-chan T, what string) T {
 func TestSendQueueBufferedAmountBudget(t *testing.T) {
 	fake := newFakeSendChannel()
 	fake.budget = 100
-	q := newSendQueue(fake, 100, nil)
+	q := newSendQueue(t.Context(), fake, 100, nil)
 	defer q.close(net.ErrClosed)
 
 	msgs := make([][]byte, 5)
@@ -183,7 +183,7 @@ func TestSendQueueFullSizeMessageResumesAtCapacity(t *testing.T) {
 	fake := newFakeSendChannel()
 	fake.budget = maxSendBufferedAmount
 	fake.setBuffered(maxSendBufferedAmount)
-	q := newSendQueue(fake, maxSendBufferedAmount, nil)
+	q := newSendQueue(t.Context(), fake, maxSendBufferedAmount, nil)
 	defer q.close(net.ErrClosed)
 
 	msg := make([]byte, maxMessageSize+1)
@@ -203,7 +203,7 @@ func TestSendQueueFullSizeMessageResumesAtCapacity(t *testing.T) {
 func TestSendQueueWaitsForOpen(t *testing.T) {
 	fake := newFakeSendChannel()
 	fake.state = webrtc.DataChannelStateConnecting
-	q := newSendQueue(fake, maxSendBufferedAmount, nil)
+	q := newSendQueue(t.Context(), fake, maxSendBufferedAmount, nil)
 	defer q.close(net.ErrClosed)
 
 	if err := q.push([]byte("queued")); err != nil {
@@ -224,7 +224,7 @@ func TestSendQueueRetainsMessagesBeyondBufferedAmountBudget(t *testing.T) {
 	fake := newFakeSendChannel()
 	fake.budget = 100
 	fake.setBuffered(200) // Over the budget: the drainer pauses immediately.
-	q := newSendQueue(fake, 100, nil)
+	q := newSendQueue(t.Context(), fake, 100, nil)
 	defer q.close(net.ErrClosed)
 
 	msgs := [][]byte{
@@ -260,7 +260,7 @@ func TestSendQueueRetainsMessagesBeyondBufferedAmountBudget(t *testing.T) {
 func TestSendQueueCloseDropsPendingMessages(t *testing.T) {
 	fake := newFakeSendChannel()
 	fake.setBuffered(200) // Over the budget: the drainer pauses immediately.
-	q := newSendQueue(fake, 100, nil)
+	q := newSendQueue(t.Context(), fake, 100, nil)
 
 	if err := q.push(make([]byte, 40)); err != nil {
 		t.Fatalf("push(40 bytes) error = %v, want nil", err)
@@ -282,7 +282,7 @@ func TestSendQueueSendErrorClosesQueue(t *testing.T) {
 	fake.sendErr = sendErr
 	failed := make(chan error, 1)
 
-	q := newSendQueue(fake, 100, func(err error) {
+	q := newSendQueue(t.Context(), fake, 100, func(err error) {
 		failed <- err
 	})
 	if err := q.push([]byte("doomed")); err != nil {
@@ -303,7 +303,7 @@ func TestConnSendFragmentsInOrder(t *testing.T) {
 
 	fake := newFakeSendChannel()
 	fake.budget = maxSendBufferedAmount
-	q := newSendQueue(fake, maxSendBufferedAmount, nil)
+	q := newSendQueue(t.Context(), fake, maxSendBufferedAmount, nil)
 	defer q.close(net.ErrClosed)
 
 	conn := &Conn{ctx: ctx}
@@ -345,7 +345,7 @@ func TestConnWriteQueuesWhileDataChannelIsFull(t *testing.T) {
 
 	fake := newFakeSendChannel()
 	fake.setBuffered(200) // Over the budget: the drainer pauses immediately.
-	q := newSendQueue(fake, 100, nil)
+	q := newSendQueue(t.Context(), fake, 100, nil)
 	defer q.close(net.ErrClosed)
 
 	conn := &Conn{ctx: ctx}
@@ -367,7 +367,7 @@ func TestConnSendClampsSegmentsToSendQueueBudget(t *testing.T) {
 
 	fake := newFakeSendChannel()
 	fake.budget = maxSendBufferedAmount
-	q := newSendQueue(fake, maxSendBufferedAmount, nil)
+	q := newSendQueue(t.Context(), fake, maxSendBufferedAmount, nil)
 	defer q.close(net.ErrClosed)
 
 	conn := &Conn{ctx: ctx}
@@ -396,5 +396,55 @@ func TestConnSendClampsSegmentsToSendQueueBudget(t *testing.T) {
 	defer fake.mu.Unlock()
 	if fake.violations != 0 {
 		t.Fatalf("%d sends exceeded the buffered-amount budget", fake.violations)
+	}
+}
+
+func TestSendQueueStopsWhenConnectionCloses(t *testing.T) {
+	for _, beforeStart := range []bool{false, true} {
+		name := "while waiting for channel"
+		if beforeStart {
+			name = "before queue starts"
+		}
+		t.Run(name, func(t *testing.T) {
+			ctx, cancel := context.WithCancelCause(t.Context())
+			cause := errors.New("connection closed")
+			defer cancel(cause)
+			fake := newFakeSendChannel()
+			fake.state = webrtc.DataChannelStateConnecting
+			if beforeStart {
+				cancel(cause)
+			}
+			q := newSendQueue(ctx, fake, 100, nil)
+			defer q.close(net.ErrClosed)
+			if !beforeStart {
+				if err := q.push([]byte("pending")); err != nil {
+					t.Fatal(err)
+				}
+				cancel(cause)
+			}
+			deadline := time.NewTimer(time.Second)
+			defer deadline.Stop()
+			tick := time.NewTicker(time.Millisecond)
+			defer tick.Stop()
+			for {
+				q.mu.Lock()
+				closed, pending := q.closed, len(q.queue)
+				q.mu.Unlock()
+				if errors.Is(closed, cause) {
+					if pending != 0 {
+						t.Fatalf("closed queue retains %d messages", pending)
+					}
+					if err := q.push([]byte("late")); !errors.Is(err, cause) {
+						t.Fatalf("push after cancellation = %v, want %v", err, cause)
+					}
+					return
+				}
+				select {
+				case <-deadline.C:
+					t.Fatal("queue survived connection cancellation")
+				case <-tick.C:
+				}
+			}
+		})
 	}
 }

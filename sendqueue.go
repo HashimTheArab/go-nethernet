@@ -1,6 +1,7 @@
 package nethernet
 
 import (
+	"context"
 	"fmt"
 	"sync"
 
@@ -38,7 +39,8 @@ type sendQueue struct {
 	closed error
 }
 
-func newSendQueue(channel sendChannel, maxBuffered uint64, fail func(error)) *sendQueue {
+// newSendQueue starts a queue owned by ctx.
+func newSendQueue(ctx context.Context, channel sendChannel, maxBuffered uint64, fail func(error)) *sendQueue {
 	q := &sendQueue{
 		channel:     channel,
 		maxBuffered: maxBuffered,
@@ -46,7 +48,7 @@ func newSendQueue(channel sendChannel, maxBuffered uint64, fail func(error)) *se
 		wake:        make(chan struct{}, 1),
 	}
 	channel.OnBufferedAmountLow(q.signal)
-	go q.run()
+	go q.run(ctx)
 	return q
 }
 
@@ -74,7 +76,10 @@ func (q *sendQueue) signal() {
 	}
 }
 
-func (q *sendQueue) run() {
+// run drains queued messages until the queue or its owner closes.
+func (q *sendQueue) run(ctx context.Context) {
+	stop := context.AfterFunc(ctx, func() { q.close(context.Cause(ctx)) })
+	defer stop()
 	for range q.wake {
 		if q.drain() != nil {
 			return

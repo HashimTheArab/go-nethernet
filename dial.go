@@ -435,6 +435,11 @@ func (d *dialerNotifier) NotifySignal(signal *Signal) bool {
 	if signal.ConnectionID != d.ConnectionID || signal.NetworkID != d.networkID {
 		return false
 	}
+	if err := signal.validate(); err != nil {
+		// This can happen when a Signaling implementation builds a Signal itself.
+		d.Log.Error("error validating signal", slog.Any("signal", signal), "error", err)
+		return false
+	}
 	select {
 	case d.signals <- signal:
 		return true
