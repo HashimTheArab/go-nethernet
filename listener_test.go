@@ -10,6 +10,7 @@ import (
 	"net"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -64,7 +65,7 @@ func TestListenerTimeoutReplyUsesConnContext(t *testing.T) {
 				}
 			}
 			// The caller sends the returned error once, even if its cause has another code.
-			n.reportError(err)
+			go n.reportError(err)
 			select {
 			case <-signaling.started:
 				if !test.expired {
@@ -126,8 +127,8 @@ func TestListenerWaitForChannelsReadyReturnsNilWhenReady(t *testing.T) {
 func TestListenerConnectionOwnership(t *testing.T) {
 	l := &Listener{negotiations: make(map[negotiationKey]*listenerNegotiator)}
 	key := negotiationKey{networkID: "remote", connectionID: 7}
-	first := &listenerNegotiator{Listener: l, key: key, closed: make(chan struct{})}
-	duplicate := &listenerNegotiator{Listener: l, key: key, closed: make(chan struct{})}
+	first := &listenerNegotiator{Listener: l, key: key, closed: make(chan struct{}), finished: true}
+	duplicate := &listenerNegotiator{Listener: l, key: key, closed: make(chan struct{}), finished: true}
 	l.negotiations[key] = first
 
 	// Cleanup from a stale owner must not unregister its replacement.
@@ -189,6 +190,15 @@ func TestListenerNonTrickleGatheringDoesNotBlockOtherOffers(t *testing.T) {
 	}
 	if response := waitListenerResponse(t, responses); response.Type != SignalTypeAnswer || response.ConnectionID != 2 {
 		t.Fatalf("response = %s, want second offer answered while first is gathering", response.String())
+	}
+	if !l.NotifySignal(&Signal{Type: SignalTypeError, NetworkID: "remote", ConnectionID: 1, Data: strconv.Itoa(ErrorCodeGenericFailure)}) {
+		t.Fatal("cancellation rejected during ICE gathering")
+	}
+	waitListenerState(t, l, 1, 1)
+	select {
+	case response := <-responses:
+		t.Fatalf("canceled gathering sent a reply: %s", response.String())
+	case <-time.After(100 * time.Millisecond):
 	}
 }
 
@@ -441,6 +451,60 @@ func TestListenerBoundsPendingNegotiations(t *testing.T) {
 	}
 }
 
+func TestListenerRemoteCancellationReleasesPendingOffers(t *testing.T) {
+	base := newBlockingCredentialsSignaling()
+	base.started = make(chan struct{}, maxListenerNegotiations)
+	t.Cleanup(base.close)
+	responses := make(chan Signal, maxListenerNegotiations)
+	l, err := (ListenConfig{
+		Log: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		NegotiationContext: func(parent context.Context) (context.Context, context.CancelFunc) {
+			return context.WithCancel(parent)
+		},
+	}).Listen(listenerResponseSignaling{base, responses})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = l.Close() })
+	offer := testOffer(t)
+	for i := range maxListenerNegotiations {
+		if !l.NotifySignal(&Signal{Type: SignalTypeOffer, NetworkID: "remote", ConnectionID: uint64(i), Data: offer}) {
+			t.Fatalf("offer %d rejected before reaching capacity", i)
+		}
+	}
+	for range maxListenerNegotiations {
+		waitForCredentialRequest(t, base.started, "pending offer")
+	}
+	// A malformed error must neither cancel the offer nor consume deferred capacity.
+	for _, data := range []string{"invalid", "-1", "4294967296"} {
+		if l.NotifySignal(&Signal{Type: SignalTypeError, NetworkID: "remote", ConnectionID: 0, Data: data}) {
+			t.Fatalf("malformed error %q was accepted", data)
+		}
+	}
+	waitListenerState(t, l, maxListenerNegotiations, maxListenerNegotiations)
+	// Cancellation must work even when the candidate queue is already full.
+	for range maxPendingSignalsPerNegotiation {
+		if !l.NotifySignal(&Signal{Type: SignalTypeCandidate, NetworkID: "remote", ConnectionID: 0, Data: "candidate"}) {
+			t.Fatal("candidate rejected before deferred capacity")
+		}
+	}
+	for i := range maxListenerNegotiations {
+		if !l.NotifySignal(&Signal{Type: SignalTypeError, NetworkID: "remote", ConnectionID: uint64(i), Data: strconv.Itoa(ErrorCodeGenericFailure)}) {
+			t.Fatalf("cancellation for offer %d rejected", i)
+		}
+	}
+	waitListenerState(t, l, 0, 0)
+	select {
+	case response := <-responses:
+		t.Fatalf("remote cancellation received an error reply: %s", response.String())
+	case <-time.After(100 * time.Millisecond):
+	}
+	if !l.NotifySignal(&Signal{Type: SignalTypeOffer, NetworkID: "remote", ConnectionID: 0, Data: offer}) {
+		t.Fatal("canceled offer prevented reuse of its connection ID")
+	}
+	waitForCredentialRequest(t, base.started, "replacement offer")
+}
+
 func TestListenerPendingOwnerHandlesDirectSignalsAndDuplicates(t *testing.T) {
 	signaling := newBlockingCredentialsSignaling()
 	close(signaling.release)
@@ -497,6 +561,9 @@ func TestListenerPendingOwnerHandlesDirectSignalsAndDuplicates(t *testing.T) {
 	if !l.NotifySignal(&Signal{Type: SignalTypeError, ConnectionID: 1, NetworkID: "remote", Data: strconv.Itoa(ErrorCodeGenericFailure)}) {
 		t.Fatal("remote error was rejected")
 	}
+	if cause := context.Cause(conn.ctx); cause == nil || !strings.Contains(cause.Error(), "remote peer notified connection failure") {
+		t.Fatalf("pending connection closed with cause %v, want remote failure", cause)
+	}
 	waitListenerState(t, l, 0, 0)
 }
 
@@ -510,32 +577,85 @@ func TestListenerAcceptReleasesAdmission(t *testing.T) {
 	waitListenerState(t, l, 0, 0)
 }
 
-func TestListenerErrorRepliesDoNotBlockNegotiations(t *testing.T) {
-	const stalled = 8
+func TestListenerReservesFailedKeyUntilReplyCompletes(t *testing.T) {
+	for _, createdConn := range []bool{false, true} {
+		t.Run(strconv.FormatBool(createdConn), func(t *testing.T) {
+			base := newBlockingCredentialsSignaling()
+			t.Cleanup(base.close)
+			data := "invalid"
+			if createdConn {
+				close(base.release)
+				data = testOffer(t) // Anonymous identity rejection closes a created Conn.
+			}
+			release := make(chan struct{}, 1)
+			t.Cleanup(func() { close(release) })
+			started := make(chan context.Context, 1)
+			l, err := (ListenConfig{Log: slog.New(slog.NewTextHandler(io.Discard, nil))}).Listen(blockedErrorSignaling{Signaling: base, started: started, release: release})
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = l.Close() })
+			if !l.NotifySignal(&Signal{Type: SignalTypeOffer, NetworkID: "remote", ConnectionID: 1, Data: data}) {
+				t.Fatal("initial offer rejected")
+			}
+			if createdConn {
+				waitForCredentialRequest(t, base.started, "original offer")
+			}
+			waitListenerErrorReply(t, started)
+			retry := &Signal{Type: SignalTypeOffer, NetworkID: "remote", ConnectionID: 1, Data: testOffer(t)}
+			if l.NotifySignal(retry) {
+				t.Fatal("replacement admitted before the old error reply finished")
+			}
+			release <- struct{}{}
+			waitListenerState(t, l, 0, 0)
+			if !l.NotifySignal(retry) {
+				t.Fatal("completed error reply did not release its key")
+			}
+			waitForCredentialRequest(t, base.started, "replacement offer")
+		})
+	}
+}
+
+func TestListenerBoundsErrorReplies(t *testing.T) {
 	base := newBlockingCredentialsSignaling()
 	t.Cleanup(base.close)
 	release := make(chan struct{})
 	t.Cleanup(func() { close(release) })
-	signaling := blockedErrorSignaling{Signaling: base, started: make(chan context.Context, stalled+1), release: release}
+	signaling := blockedErrorSignaling{Signaling: base, started: make(chan context.Context, maxListenerNegotiations), release: release}
 	l, err := (ListenConfig{Log: slog.New(slog.NewTextHandler(io.Discard, nil))}).Listen(signaling)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = l.Close() })
-	stallListenerErrorReplies(t, l, signaling.started, stalled)
-	waitListenerState(t, l, 0, 0)
+	// Stalled failures consume only their own slots while other offers can progress.
+	stallListenerErrorReplies(t, l, signaling.started, maxListenerNegotiations-1)
+	waitListenerState(t, l, maxListenerNegotiations-1, maxListenerNegotiations-1)
 	if !l.NotifySignal(&Signal{Type: SignalTypeOffer, NetworkID: "remote", ConnectionID: 1, Data: testOffer(t)}) {
-		t.Fatal("stalled error replies prevented a new negotiation")
+		t.Fatal("stalled error replies prevented an offer within capacity")
 	}
 	waitForCredentialRequest(t, base.started, "offer while error replies stall")
-	if !l.NotifySignal(&Signal{Type: SignalTypeOffer, NetworkID: "invalid", ConnectionID: stalled, Data: "invalid"}) {
-		t.Fatal("stalled error replies blocked signal processing")
+	// Cancellation frees the active offer slot, even while failure delivery is stalled.
+	if !l.NotifySignal(&Signal{Type: SignalTypeError, NetworkID: "remote", ConnectionID: 1, Data: strconv.Itoa(ErrorCodeGenericFailure)}) {
+		t.Fatal("remote cancellation rejected")
 	}
-	waitListenerState(t, l, 1, 1)
-	// Replies are never dropped: the new failure reports even while earlier replies stall.
+	waitListenerState(t, l, maxListenerNegotiations-1, maxListenerNegotiations-1)
+	if !l.NotifySignal(&Signal{Type: SignalTypeOffer, NetworkID: "invalid", ConnectionID: maxListenerNegotiations, Data: "invalid"}) {
+		t.Fatal("last available slot was not admitted")
+	}
 	waitListenerErrorReply(t, signaling.started)
-	_ = l.Close()
+	waitListenerState(t, l, maxListenerNegotiations, maxListenerNegotiations)
+	if l.NotifySignal(&Signal{Type: SignalTypeOffer, NetworkID: "overflow", ConnectionID: 1, Data: "invalid"}) {
+		t.Fatal("stalled failure replies did not bound admission")
+	}
+	// Releasing delivery frees capacity, and every admitted failure was attempted.
+	for range maxListenerNegotiations {
+		release <- struct{}{}
+	}
 	waitListenerState(t, l, 0, 0)
+	if !l.NotifySignal(&Signal{Type: SignalTypeOffer, NetworkID: "remote", ConnectionID: 1, Data: testOffer(t)}) {
+		t.Fatal("finished error replies did not release admission")
+	}
+	waitForCredentialRequest(t, base.started, "offer after error delivery")
 }
 
 // blockedErrorSignaling holds error responses until their delivery context ends,
@@ -728,6 +848,41 @@ func TestAcceptedConnHandlesLateErrorSignal(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("accepted connection did not close after remote error")
 	}
+}
+
+func TestListenerRemoteErrorDoesNotWaitForTransportCleanup(t *testing.T) {
+	client, server := newMemorySignalingPair("client", "server")
+	t.Cleanup(client.close)
+	t.Cleanup(server.close)
+	l, _, conn := dialAcceptedListener(t, client, server)
+	addr := conn.RemoteAddr().(*Addr)
+	// Hold cleanup at the channel snapshot while the signaling callback runs.
+	conn.channelsMu.Lock()
+	unlock := sync.OnceFunc(conn.channelsMu.Unlock)
+	t.Cleanup(unlock)
+	returned := make(chan bool, 1)
+	go func() {
+		returned <- l.NotifySignal(&Signal{
+			Type: SignalTypeError, NetworkID: addr.NetworkID,
+			ConnectionID: addr.ConnectionID, Data: strconv.Itoa(ErrorCodeGenericFailure),
+		})
+	}()
+	select {
+	case accepted := <-returned:
+		if !accepted {
+			t.Fatal("remote error rejected")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("remote error blocked signaling on transport cleanup")
+	}
+	if cause := context.Cause(conn.ctx); cause == nil || !strings.Contains(cause.Error(), "remote peer notified connection failure") {
+		t.Fatalf("remote error returned before canceling connection: %v", cause)
+	}
+	unlock()
+	if err := conn.Close(); err != nil {
+		t.Fatal(err)
+	}
+	waitListenerState(t, l, 0, 0)
 }
 
 func TestAcceptedConnSurvivesListenerClose(t *testing.T) {

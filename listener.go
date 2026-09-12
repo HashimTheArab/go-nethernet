@@ -23,6 +23,8 @@ import (
 
 // ListenConfig encapsulates options for creating a new Listener through [ListenConfig.Listen].
 // It allows customizing logging, WebRTC API settings, and contexts for negotiations.
+// Its callbacks may run concurrently for different connections and must synchronize
+// access to any shared mutable state.
 type ListenConfig struct {
 	// Log is used for logging messages at various levels. If nil, the default [slog.Logger] will be set from
 	// [slog.Default]. Log will be extended when a Conn is being accepted by [Listener.Accept] with additional
@@ -224,7 +226,7 @@ type negotiationKey struct {
 
 // listenerNegotiator handles one offer in a goroutine through acceptance or
 // failure, so local ICE gathering and user callbacks do not block other offers.
-// Candidates and errors are handled directly once the Conn is published.
+// Candidates are deferred until the Conn is published; remote errors cancel immediately.
 type listenerNegotiator struct {
 	key negotiationKey
 
@@ -232,23 +234,27 @@ type listenerNegotiator struct {
 	mu       sync.Mutex
 
 	conn *Conn
+	// finished is guarded by mu and marks completion of the offer and any failure reply.
+	finished bool
 	// closed cancels this negotiation when its connection or listener closes.
 	closed chan struct{}
 	once   sync.Once
+	// remoteCanceled suppresses failure replies after the peer cancels negotiation.
+	remoteCanceled atomic.Bool
 
 	// Listener is the parent Listener that received the offer signal via NotifySignal.
 	*Listener
 }
 
 const (
-	// maxListenerNegotiations bounds offer goroutines through acceptance or failure.
+	// maxListenerNegotiations bounds offer goroutines through acceptance or failure delivery.
 	maxListenerNegotiations = 64
 	// maxPendingSignalsPerNegotiation bounds signals received before Conn publication.
 	maxPendingSignalsPerNegotiation = 32
 )
 
-// enqueueSignal defers candidates and errors until the offer creates its Conn.
-// Once published, the Conn handles signals directly in the notifying goroutine.
+// enqueueSignal defers candidates until the offer publishes its Conn.
+// Remote errors cancel pending work and close any published Conn immediately.
 // It returns false for duplicate offers, a full deferred buffer, or a closed owner.
 func (n *listenerNegotiator) enqueueSignal(signal *Signal) bool {
 	select {
@@ -261,7 +267,25 @@ func (n *listenerNegotiator) enqueueSignal(signal *Signal) bool {
 		// A duplicate shares the original connection ID, so an error reply would
 		// close the original peer. Reject it without sending a connection error.
 		return false
-	case SignalTypeCandidate, SignalTypeError:
+	case SignalTypeError:
+		if _, err := strconv.ParseUint(signal.Data, 10, 32); err != nil {
+			n.log().Error("error parsing remote error code", "error", err)
+			return false
+		}
+		n.mu.Lock()
+		n.remoteCanceled.Store(true)
+		conn := n.conn
+		n.mu.Unlock()
+		if conn != nil {
+			if err := conn.handleSignal(signal); err != nil {
+				conn.log.Error("error handling signal", "error", err)
+				return false
+			}
+		} else {
+			n.close()
+		}
+		return true
+	case SignalTypeCandidate:
 		n.mu.Lock()
 		select {
 		case <-n.closed:
@@ -274,11 +298,8 @@ func (n *listenerNegotiator) enqueueSignal(signal *Signal) bool {
 			if conn.Context().Err() != nil {
 				return false
 			}
-			// Remote errors close synchronously and call back into the negotiator,
-			// so no owner lock may be held while handling the signal.
 			if err := conn.handleSignal(signal); err != nil {
 				conn.log.Error("error handling signal", "error", err)
-				n.reportError(err)
 				return false
 			}
 			return true
@@ -298,9 +319,9 @@ func (n *listenerNegotiator) enqueueSignal(signal *Signal) bool {
 	}
 }
 
-// negotiate holds one admission slot until the offer is accepted or fails.
+// negotiate holds one admission slot until acceptance or the failure reply completes.
 func (n *listenerNegotiator) negotiate(offer *Signal) {
-	defer func() { <-n.sem }()
+	defer n.finish()
 	if err := n.handleOffer(offer); err != nil {
 		n.close()
 		n.reportError(err)
@@ -312,31 +333,45 @@ func (n *listenerNegotiator) negotiate(offer *Signal) {
 	}
 }
 
+// finish releases admission and removes a closed owner after its final reply.
+// Open, accepted connections keep their owner for later signals.
+func (n *listenerNegotiator) finish() {
+	n.mu.Lock()
+	n.finished = true
+	closed := n.Context().Err() != nil
+	n.mu.Unlock()
+	if closed {
+		n.unregister()
+	}
+	<-n.sem
+}
+
 // reportError sends a bounded error reply when err carries a signaling code.
 func (n *listenerNegotiator) reportError(err error) {
+	if n.remoteCanceled.Load() {
+		return
+	}
 	var s *signalError
 	if errors.As(err, &s) {
 		n.signalError(s.code)
 	}
 }
 
-// signalError sends an error reply asynchronously so slow signaling never stalls
-// NotifySignal or holds a negotiation slot; it is abandoned after [SignalErrorTimeout].
+// signalError sends an error reply from the offer goroutine under a separate timeout.
+// Keeping its admission slot until delivery finishes bounds slow signaling work
+// without dropping replies for offers the listener has already admitted.
 func (n *listenerNegotiator) signalError(code int) {
-	response := &Signal{
+	// The connection may already have closed; use the listener's lifetime.
+	ctx, cancel := context.WithTimeout(n.Listener.Context(), SignalErrorTimeout)
+	defer cancel()
+	if err := n.signaling.Signal(ctx, &Signal{
 		Type:         SignalTypeError,
 		ConnectionID: n.key.connectionID,
 		NetworkID:    n.key.networkID,
 		Data:         strconv.Itoa(code),
+	}); err != nil {
+		n.conf.Log.Error("error signaling error", slog.Any("error", err))
 	}
-	go func() {
-		// The connection may already have closed; use the listener's lifetime.
-		ctx, cancel := context.WithTimeout(n.Listener.Context(), SignalErrorTimeout)
-		defer cancel()
-		if err := n.signaling.Signal(ctx, response); err != nil {
-			n.conf.Log.Error("error signaling error", slog.Any("error", err))
-		}
-	}()
 }
 
 // Context is canceled when this connection owner or its listener closes.
@@ -344,19 +379,28 @@ func (n *listenerNegotiator) Context() context.Context {
 	return listenerContext{n.closed}
 }
 
-// close unregisters the owner and cancels its pending negotiation once.
+// close cancels the owner once. Pending offers retain their key until finish,
+// so a delayed failure reply cannot reach a replacement connection with that key.
 func (n *listenerNegotiator) close() {
 	n.once.Do(func() {
 		close(n.closed)
 		n.mu.Lock()
 		n.deferred = nil
+		finished := n.finished
 		n.mu.Unlock()
-		n.negotiationsMu.Lock()
-		if n.negotiations[n.key] == n {
-			delete(n.negotiations, n.key)
+		if finished {
+			n.unregister()
 		}
-		n.negotiationsMu.Unlock()
 	})
+}
+
+// unregister removes this owner without disturbing a replacement using its key.
+func (n *listenerNegotiator) unregister() {
+	n.negotiationsMu.Lock()
+	if n.negotiations[n.key] == n {
+		delete(n.negotiations, n.key)
+	}
+	n.negotiationsMu.Unlock()
 }
 
 // handleOffer handles an incoming Signal of SignalTypeOffer. It parses the data of Signal into [sdp.SessionDescription]
@@ -510,6 +554,11 @@ func (n *listenerNegotiator) handleOffer(signal *Signal) error {
 		n.mu.Unlock()
 		return net.ErrClosed
 	default:
+	}
+	// A remote error may have claimed cancellation before close acquires the lock.
+	if n.remoteCanceled.Load() {
+		n.mu.Unlock()
+		return net.ErrClosed
 	}
 	n.conn = c
 	deferred := n.deferred
