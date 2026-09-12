@@ -426,11 +426,7 @@ func (conn *Conn) handleSignal(signal *Signal) error {
 	case SignalTypeError:
 		code, err := strconv.ParseUint(signal.Data, 10, 32)
 		if err != nil {
-			e := fmt.Errorf("parse error code: %w", err)
-			if err := conn.close(fmt.Errorf("nethernet: remote peer notified connection failure (invalid code: %q)", signal.Data)); err != nil {
-				e = errors.Join(fmt.Errorf("close: %w", err), e)
-			}
-			return e
+			return fmt.Errorf("parse error code: %w", err)
 		}
 		if err := conn.close(fmt.Errorf("nethernet: remote peer notified connection failure (code: %d)", code)); err != nil {
 			return fmt.Errorf("close: %w", err)
