@@ -261,7 +261,8 @@ const (
 
 // handleSignal handles the given Signal received from the remote network.
 // Candidates are deferred until the offer publishes its Conn.
-// Valid remote errors cancel pending work or close the published Conn immediately.
+// Valid remote errors cancel pending work or the published Conn immediately.
+// Transport cleanup runs in the background.
 func (n *listenerNegotiator) handleSignal(signal *Signal) bool {
 	select {
 	case <-n.closed:
