@@ -11,6 +11,7 @@ import (
 	"math"
 	"math/rand/v2"
 	"net"
+	"net/netip"
 	"slices"
 	"strconv"
 	"strings"
@@ -73,11 +74,14 @@ type Conn struct {
 	channels [messageReliabilityCapacity]*dataChannel
 	// channelsMu guards channels from concurrent read-write access during startup and closure.
 	channelsMu sync.RWMutex
+	// maxSegmentPayload is the negotiated SCTP message size minus the one-byte
+	// NetherNet fragment header.
+	maxSegmentPayload atomic.Uint32
 
 	readMu  sync.Mutex
 	readBuf []byte
 
-	// once ensures that the Conn is closed only once.
+	// once ensures that the Conn transports are closed only once.
 	once sync.Once
 
 	log *slog.Logger
@@ -91,7 +95,7 @@ type Conn struct {
 	// ctx is the background context associated with the Conn.
 	ctx context.Context
 	// cancel is the function used to cancel the ctx with a cause.
-	// It is called by close and must not be called elsewhere.
+	// The first cause is preserved.
 	cancel context.CancelCauseFunc
 }
 
@@ -125,7 +129,7 @@ func (conn *Conn) Receive(r MessageReliability) ([]byte, error) {
 	}
 	select {
 	case <-conn.ctx.Done():
-		return nil, context.Cause(conn.ctx)
+		return nil, errors.Join(context.Cause(conn.ctx), net.ErrClosed)
 	case pk := <-conn.channel(r).packets:
 		return pk, nil
 	}
@@ -188,8 +192,12 @@ func (conn *Conn) Send(data []byte, reliability MessageReliability) (n int, err 
 		if reliability >= messageReliabilityCapacity {
 			return 0, fmt.Errorf("invalid message reliability: %d", reliability)
 		}
-		if reliability == MessageReliabilityUnreliable && len(data) > maxMessageSize {
-			return 0, fmt.Errorf("data larger than %d (received: %d) cannot be sent over UnreliableDataChannel", maxMessageSize, len(data))
+		segmentSize := int(conn.maxSegmentPayload.Load())
+		if segmentSize == 0 {
+			segmentSize = maxMessageSize
+		}
+		if reliability == MessageReliabilityUnreliable && len(data) > segmentSize {
+			return 0, fmt.Errorf("data larger than %d (received: %d) cannot be sent over UnreliableDataChannel", segmentSize, len(data))
 		}
 		d := conn.channel(reliability)
 
@@ -198,17 +206,19 @@ func (conn *Conn) Send(data []byte, reliability MessageReliability) (n int, err 
 		defer d.write.Unlock()
 
 		// Each segment is prefixed with a uint8 remaining-segment counter that starts
-		// at totalSegments-1 and decrements to 0 for the final segment. This limits
-		// the maximum number of segments to math.MaxUint8+1 (256).
-		const maxSegments = math.MaxUint8 + 1
-		totalSegments := (len(data) + maxMessageSize - 1) / maxMessageSize
-		if totalSegments > maxSegments {
-			return 0, fmt.Errorf("data too large: %d bytes requires %d segments (max %d)", len(data), totalSegments, maxSegments)
+		// at totalSegments-1 and decrements to 0 for the final segment. Vanilla
+		// limits the total number of segments to math.MaxUint8 (255).
+		totalSegments := 0
+		if len(data) != 0 {
+			totalSegments = (len(data)-1)/segmentSize + 1
+		}
+		if totalSegments > math.MaxUint8 {
+			return 0, fmt.Errorf("data too large: %d bytes requires %d segments (max %d)", len(data), totalSegments, math.MaxUint8)
 		}
 
 		remaining := totalSegments - 1
-		for i := 0; i < len(data); i += maxMessageSize {
-			frag := data[i:min(len(data), i+maxMessageSize)]
+		for i := 0; i < len(data); i += segmentSize {
+			frag := data[i:min(len(data), i+segmentSize)]
 			if err := d.Send(append([]byte{uint8(remaining)}, frag...)); err != nil {
 				return n, fmt.Errorf("write segment #%d: %w", totalSegments-1-remaining, closedWriteError(err))
 			}
@@ -397,8 +407,15 @@ func (conn *Conn) handleTransports() {
 // If the Signal is of SignalTypeCandidate, it parses a [webrtc.ICECandidate] from its data and
 // adds it to the ICE transport of the Conn.
 //
-// If the Signal is of SignalTypeError, it closes the Conn immediately.
+// If the Signal is of SignalTypeError, it cancels the Conn immediately and closes
+// its transports in the background.
 func (conn *Conn) handleSignal(signal *Signal) error {
+	select {
+	case <-conn.Context().Done():
+		return context.Cause(conn.Context())
+	default:
+	}
+
 	switch signal.Type {
 	case SignalTypeCandidate:
 		candidate, err := parseRemoteCandidate(signal.Data)
@@ -409,13 +426,13 @@ func (conn *Conn) handleSignal(signal *Signal) error {
 			return err
 		}
 	case SignalTypeError:
-		code, err := strconv.ParseUint(signal.Data, 10, 32)
+		code, err := parseSignalErrorCode(signal.Data)
 		if err != nil {
 			return fmt.Errorf("parse error code: %w", err)
 		}
-		if err := conn.close(fmt.Errorf("nethernet: remote peer notified connection failure (code: %d)", code)); err != nil {
-			return fmt.Errorf("close: %w", err)
-		}
+		cause := fmt.Errorf("nethernet: remote peer notified connection failure (code: %d)", code)
+		conn.cancel(cause)
+		go conn.close(cause)
 	default:
 		return fmt.Errorf("unknown signal type: %s", signal.Type)
 	}
@@ -548,6 +565,9 @@ func parseDescription(d *sdp.SessionDescription) (*description, error) {
 	if err != nil {
 		return nil, fmt.Errorf("parse max-message-size attribute as uint32: %w", err)
 	}
+	if maxMessageSize <= 1 {
+		return nil, fmt.Errorf("max-message-size attribute must exceed one byte: %d", maxMessageSize)
+	}
 
 	var candidates []webrtc.ICECandidate
 	for _, attr := range append(d.Attributes, m.Attributes...) {
@@ -590,7 +610,8 @@ func parseDescription(d *sdp.SessionDescription) (*description, error) {
 // before the offer or answer is encoded so they can be embedded into the SDP.
 //
 // The gather is aborted if ctx is canceled or if conn is closed.
-func (conn *Conn) gatherCandidates(ctx context.Context) (candidates []webrtc.ICECandidate, _ error) {
+func (conn *Conn) gatherCandidates(ctx context.Context) ([]webrtc.ICECandidate, error) {
+	var candidates []webrtc.ICECandidate
 	complete := make(chan struct{})
 	conn.gatherer.OnLocalCandidate(func(candidate *webrtc.ICECandidate) {
 		if candidate == nil {
@@ -684,6 +705,58 @@ type description struct {
 	candidates []webrtc.ICECandidate
 }
 
+// defaultCandidate returns the ICE candidate to be used as the connection address for the media section in SDP.
+// It returns a zero candidate with false when trickle ICE is enabled or none of the candidates are suitable.
+// See https://webrtc.googlesource.com/src/+/refs/heads/main/api/jsep.cc#43.
+func (desc description) defaultCandidate() (candidate webrtc.ICECandidate, _ bool) {
+	if len(desc.candidates) == 0 {
+		return candidate, false
+	}
+	var (
+		currentFamily     uint8
+		currentPreference uint16
+		selected          bool
+	)
+	for _, c := range desc.candidates {
+		if c.Protocol != webrtc.ICEProtocolUDP || c.Component != uint16(webrtc.ICEComponentRTP) {
+			continue
+		}
+		var family uint8
+		if ip, err := netip.ParseAddr(c.Address); err == nil {
+			if ip.Is4() {
+				family = 4
+			} else {
+				family = 6
+			}
+		}
+		pref := typePreference(c)
+		if (pref <= currentPreference && currentFamily == family) ||
+			(currentFamily == 4 && family == 6) {
+			// Do not use a candidate with a lower or equal preference from the same address family,
+			// or an IPv6 candidate when the current candidate is IPv4.
+			continue
+		}
+		candidate, currentFamily, currentPreference, selected = c, family, pref, true
+	}
+	return candidate, selected
+}
+
+// typePreference returns libwebrtc's default-candidate preference for the given [webrtc.ICECandidate].
+// This preference ranks likely reachability and is distinct from the candidate's ICE priority.
+// See https://webrtc.googlesource.com/src/+/refs/heads/main/api/candidate.h#141.
+func typePreference(candidate webrtc.ICECandidate) uint16 {
+	switch candidate.Typ {
+	case webrtc.ICECandidateTypeHost:
+		return 1
+	case webrtc.ICECandidateTypeSrflx:
+		return 2
+	case webrtc.ICECandidateTypeRelay:
+		return 3
+	default:
+		return 0
+	}
+}
+
 // encode transforms the description into a [sdp.SessionDescription] and encodes them using the [sdp.SessionDescription.Marshal]
 // method. It is called by a negotiator (Listener or Dialer) to signal an offer or answer to the remote connection with the local
 // parameters of each transport within a Conn.
@@ -730,6 +803,18 @@ func (desc description) encode() ([]byte, error) {
 				Address: "0.0.0.0",
 			},
 		},
+	}
+
+	// Use the default candidate's address as the connection address for
+	// the media description whenever possible.
+	if candidate, ok := desc.defaultCandidate(); ok {
+		if ip, err := netip.ParseAddr(candidate.Address); err == nil {
+			if ip.Is6() {
+				media.ConnectionInformation.AddressType = "IP6"
+			}
+			media.MediaName.Port = sdp.RangedPort{Value: int(candidate.Port)}
+			media.ConnectionInformation.Address = &sdp.Address{Address: candidate.Address}
+		}
 	}
 
 	// When Trickle ICE is disabled, local ICE candidates are embedded directly in
@@ -804,6 +889,9 @@ func newConn(api *webrtc.API, gathererOpts webrtc.ICEGatherOptions, id uint64, n
 	if len(dtlsParams.Fingerprints) == 0 {
 		return nil, wrapSignalError(errors.New("local DTLS parameters has no fingerprints"), localDescriptionErrorCode)
 	}
+	for i, fingerprint := range dtlsParams.Fingerprints {
+		dtlsParams.Fingerprints[i].Value = strings.ToUpper(fingerprint.Value)
+	}
 	sctpCapabilities := sctpTransport.GetCapabilities()
 
 	c := &Conn{
@@ -832,6 +920,7 @@ func newConn(api *webrtc.API, gathererOpts webrtc.ICEGatherOptions, id uint64, n
 		localNetworkID: localNetworkID,
 	}
 	c.ctx, c.cancel = context.WithCancelCause(context.Background())
+	c.maxSegmentPayload.Store(maxMessageSize)
 	c.handleTransports()
 	return c, nil
 }

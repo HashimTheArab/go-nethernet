@@ -71,7 +71,8 @@ func (i Identity) sign(desc *description) error {
 
 // claimPublicKey extracts and validates the public key from the 'cpk' claim in the JWT token.
 // If selfSigned is true, it verifies that the token is self-signed with the corresponding private key.
-// It also validates standard JWT claims such as expiration time.
+// Client identity tokens have their standard JWT claims validated, while server identity
+// tokens do not have their temporal claims validated to match Bedrock behavior.
 func claimPublicKey(token string, selfSigned bool) (*ecdsa.PublicKey, error) {
 	t, err := jwt.ParseSigned(token, []jose.SignatureAlgorithm{
 		// Server identity tokens are self-signed using ES384
@@ -86,8 +87,10 @@ func claimPublicKey(token string, selfSigned bool) (*ecdsa.PublicKey, error) {
 	if err := t.UnsafeClaimsWithoutVerification(&claims); err != nil {
 		return nil, fmt.Errorf("extract JWT claims: %w", err)
 	}
-	if err := claims.Validate(jwt.Expected{Time: time.Now()}); err != nil {
-		return nil, fmt.Errorf("validate JWT claims: %w", err)
+	if !selfSigned {
+		if err := claims.Validate(jwt.Expected{Time: time.Now()}); err != nil {
+			return nil, fmt.Errorf("validate JWT claims: %w", err)
+		}
 	}
 	if selfSigned {
 		// Verify that server identity tokens are self-signed using the corresponding
@@ -148,15 +151,17 @@ type tokenClaims struct {
 // MarshalJSON implements [json.Marshaler] for tokenClaims.
 // It performs additional handling for encoding the cpk claim in base64.
 func (c tokenClaims) MarshalJSON() ([]byte, error) {
-	type Alias tokenClaims
-	publicKey, err := encodePublicKey(c.PublicKey)
-	if err != nil {
-		return nil, fmt.Errorf("encode cpk: %w", err)
+	if c.PublicKey == nil {
+		return nil, errors.New("nethernet: public key is nil")
 	}
+	type Alias tokenClaims
 	return json.Marshal(struct {
 		Alias
-		PublicKey string `json:"cpk"`
-	}{Alias: (Alias)(c), PublicKey: publicKey})
+		PublicKey jose.JSONWebKey `json:"cpk"`
+	}{
+		Alias:     (Alias)(c),
+		PublicKey: jose.JSONWebKey{Key: c.PublicKey},
+	})
 }
 
 // UnmarshalJSON implements [json.Unmarshaler] for tokenClaims.
@@ -242,7 +247,7 @@ func (d identityData) Valid() bool {
 		return s != "" && strings.Count(s, ".") == 2
 	}
 	return validJWS(d.Assertion.Token) && validJWS(d.Assertion.Fingerprints) &&
-		d.IdentityProvider.Protocol == "default" && d.IdentityProvider.Domain != ""
+		d.IdentityProvider.Protocol == "default"
 }
 
 // verify verifies the fingerprints signature in the identity assertion using the provided public key.
@@ -306,12 +311,15 @@ func parsePublicKey(data []byte) (*ecdsa.PublicKey, error) {
 	var publicKey crypto.PublicKey
 	switch data[0] {
 	case '{':
+		// 26.40+ clients use JWK to represent public keys.
 		var key jose.JSONWebKey
 		if err := json.Unmarshal(data, &key); err != nil {
 			return nil, err
 		}
 		publicKey = key.Key
 	case '"':
+		// Pre 26.40 clients used base64-encoded DER public keys in the same format
+		// as seen in the connection request included in the Login packet.
 		var s string
 		if err := json.Unmarshal(data, &s); err != nil {
 			return nil, err
