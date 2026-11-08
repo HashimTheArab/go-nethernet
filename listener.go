@@ -446,12 +446,9 @@ func (n *listenerNegotiator) handleOffer(signal *Signal) error {
 		ctx, cancel = context.WithTimeout(parent, time.Second*15)
 		defer cancel()
 	}
-	credentials, err := gatherCredentials(ctx, n.signaling, n.conf.ICEGatherPolicy)
+	credentials, err := gatherCredentials(ctx, n.signaling, nil, n.conf.ICEGatherPolicy)
 	if err != nil {
 		return wrapSignalError(fmt.Errorf("obtain credentials: %w", err), ErrorCodeSignalingTurnAuthFailed)
-	}
-	if n.conf.ICEGatherPolicy == webrtc.ICETransportPolicyRelay && !hasTURNServer(credentials) {
-		return wrapSignalError(ErrNoTURNServer, ErrorCodeSignalingTurnAuthFailed)
 	}
 
 	c, err := newConn(

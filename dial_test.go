@@ -154,8 +154,7 @@ func (s *awaitingSignaling) AwaitCredentials(context.Context) (*Credentials, err
 	return &Credentials{ICEServers: s.servers}, s.err
 }
 
-// A relay-only dial waits for TURN servers through AwaitCredentials and fails at once when the
-// answer is an error or names no TURN server it can authenticate to; other dials never wait.
+// A relay-only dial waits through AwaitCredentials and fails at once without a usable TURN server.
 func TestRelayOnlyDialRequiresTURNServer(t *testing.T) {
 	stun := ICEServer{URLs: []string{"stun:relay.example:3478"}}
 	anonymous := ICEServer{URLs: []string{"turn:relay.example:3478"}}
@@ -180,6 +179,9 @@ func TestRelayOnlyDialRequiresTURNServer(t *testing.T) {
 		if len(signaling.signals) != 0 {
 			t.Fatalf("%s: dial signaled an offer", name)
 		}
+		if !signaling.awaited.Load() {
+			t.Fatalf("%s: relay-only dial did not wait through AwaitCredentials", name)
+		}
 	}
 
 	signaling := &awaitingSignaling{recordingSignaling: recordingSignaling{id: "1", ctx: context.Background(), signals: make(chan *Signal, 8)}}
@@ -191,8 +193,7 @@ func TestRelayOnlyDialRequiresTURNServer(t *testing.T) {
 	}
 }
 
-// A relay-only dial whose TURN server refuses the allocation fails once gathering ends, rather than
-// waiting for an answer to an offer the remote peer could never reach.
+// A relay-only dial whose TURN server refuses the allocation fails once gathering ends.
 func TestRelayOnlyDialFailsWithoutRelayCandidate(t *testing.T) {
 	turnURL := startTURNServer(t, false)
 	for _, bundled := range []bool{false, true} {
@@ -213,8 +214,7 @@ func TestRelayOnlyDialFailsWithoutRelayCandidate(t *testing.T) {
 	}
 }
 
-// A relay-only listener waits for TURN servers through AwaitCredentials and, with none, answers the
-// offer with ErrorCodeSignalingTurnAuthFailed.
+// A relay-only listener waits through AwaitCredentials and answers ErrorCodeSignalingTurnAuthFailed without TURN.
 func TestRelayOnlyListenerRequiresTURNServer(t *testing.T) {
 	signaling := &awaitingSignaling{recordingSignaling: recordingSignaling{id: "1", ctx: context.Background(), signals: make(chan *Signal, 8)}}
 	l, err := (ListenConfig{ICEGatherPolicy: webrtc.ICETransportPolicyRelay, Log: slog.New(slog.DiscardHandler)}).Listen(signaling)

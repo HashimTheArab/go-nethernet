@@ -23,7 +23,7 @@ type ICEServer struct {
 }
 
 // ErrNoTURNServer is returned by relay-only gathering whose Credentials name no TURN server with a username.
-var ErrNoTURNServer = errors.New("relay-only gathering: no TURN server with a username")
+var ErrNoTURNServer = errors.New("nethernet: relay-only gathering: no TURN server with a username")
 
 // hasTURNServer reports whether credentials name a TURN server with a username.
 func hasTURNServer(credentials *Credentials) bool {

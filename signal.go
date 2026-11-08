@@ -69,13 +69,25 @@ type CredentialsAwaiter interface {
 	AwaitCredentials(ctx context.Context) (*Credentials, error)
 }
 
-// gatherCredentials returns the Credentials to gather with. Relay-only gathering finds nothing
-// without TURN servers, so it waits for them on Signaling implementing [CredentialsAwaiter].
-func gatherCredentials(ctx context.Context, signaling Signaling, policy webrtc.ICEGatherPolicy) (*Credentials, error) {
-	if awaiter, ok := signaling.(CredentialsAwaiter); ok && policy == webrtc.ICETransportPolicyRelay {
-		return awaiter.AwaitCredentials(ctx)
+// gatherCredentials returns the Credentials to gather with, from source if non-nil or else from
+// signaling. Relay-only gathering finds nothing without a TURN server, so it waits for one on
+// Signaling implementing [CredentialsAwaiter] and fails with [ErrNoTURNServer] without one.
+func gatherCredentials(ctx context.Context, signaling Signaling, source func(context.Context) (*Credentials, error), policy webrtc.ICEGatherPolicy) (*Credentials, error) {
+	relayOnly := policy == webrtc.ICETransportPolicyRelay
+	if source == nil {
+		source = signaling.Credentials
+		if awaiter, ok := signaling.(CredentialsAwaiter); ok && relayOnly {
+			source = awaiter.AwaitCredentials
+		}
 	}
-	return signaling.Credentials(ctx)
+	credentials, err := source(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if relayOnly && !hasTURNServer(credentials) {
+		return nil, ErrNoTURNServer
+	}
+	return credentials, nil
 }
 
 // shouldDisableTrickleICE determines whether Trickle ICE should be disabled
