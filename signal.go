@@ -61,6 +61,22 @@ type trickleICEDisabler interface {
 	DisableTrickleICE() bool
 }
 
+// credentialsAwaiter is implemented by Signaling whose Credentials answers at once, possibly with no
+// servers, while a TURN request is in flight.
+type credentialsAwaiter interface {
+	// AwaitCredentials returns the answer to the TURN request in flight, or its error.
+	AwaitCredentials(ctx context.Context) (*Credentials, error)
+}
+
+// gatherCredentials returns the Credentials to gather with. Relay-only gathering finds nothing
+// without TURN servers, so it waits for them on Signaling implementing [credentialsAwaiter].
+func gatherCredentials(ctx context.Context, signaling Signaling, policy webrtc.ICEGatherPolicy) (*Credentials, error) {
+	if awaiter, ok := signaling.(credentialsAwaiter); ok && policy == webrtc.ICETransportPolicyRelay {
+		return awaiter.AwaitCredentials(ctx)
+	}
+	return signaling.Credentials(ctx)
+}
+
 // shouldDisableTrickleICE determines whether Trickle ICE should be disabled
 // for negotiating a WebRTC peer connections with the remote network.
 // The config value must be specified from [ListenConfig.DisableTrickleICE]

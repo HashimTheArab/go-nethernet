@@ -807,6 +807,10 @@ func (conn *Conn) trickleCandidates(signaling Signaling) error {
 		// ICEGatherer already tracks its internal state, so we don't need to check if the connection is closed.
 		if candidate == nil {
 			conn.log.Debug("end of candidate")
+			if candidateIndex.Load() == 0 {
+				// Nothing was signaled, so the remote peer can never reach us.
+				_ = conn.close(errNoCandidates)
+			}
 			return
 		}
 		// Signal the local candidate in a goroutine so candidate gathering is never blocked by signaling.

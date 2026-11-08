@@ -438,25 +438,7 @@ func TestSignaledCandidateHidesRelayRelatedAddress(t *testing.T) {
 
 // A relay-only dial through a TURN server signals its relay candidates without the local address.
 func TestRelayOnlyDialHidesLocalAddress(t *testing.T) {
-	udp, err := net.ListenPacket("udp4", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	server, err := turn.NewServer(turn.ServerConfig{
-		Realm: "test",
-		AuthHandler: func(ra *turn.RequestAttributes) (string, []byte, bool) {
-			return ra.Username, turn.GenerateAuthKey(ra.Username, ra.Realm, "pass"), true
-		},
-		PacketConnConfigs: []turn.PacketConnConfig{{
-			PacketConn:            udp,
-			RelayAddressGenerator: &turn.RelayAddressGeneratorStatic{RelayAddress: net.ParseIP("127.0.0.1"), Address: "127.0.0.1"},
-		}},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = server.Close() })
-
+	turnURL := startTURNServer(t, true)
 	for _, bundled := range []bool{false, true} {
 		signaling := &recordingSignaling{id: "1", ctx: context.Background(), signals: make(chan *Signal, 64)}
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -467,7 +449,7 @@ func TestRelayOnlyDialHidesLocalAddress(t *testing.T) {
 				ICEGatherPolicy:   webrtc.ICETransportPolicyRelay,
 				DisableTrickleICE: bundled,
 				Credentials: func(context.Context) (*Credentials, error) {
-					return &Credentials{ICEServers: []ICEServer{{Username: "user", Password: "pass", URLs: []string{"turn:" + udp.LocalAddr().String() + "?transport=udp"}}}}, nil
+					return &Credentials{ICEServers: []ICEServer{{Username: "user", Password: "pass", URLs: []string{turnURL}}}}, nil
 				},
 			}).DialContext(ctx, "2", signaling)
 		}()
@@ -497,4 +479,29 @@ func awaitRelayCandidate(ctx context.Context, signals <-chan *Signal) string {
 			return ""
 		}
 	}
+}
+
+// startTURNServer starts a local TURN server that grants allocations only when allow is set, and
+// returns its URL.
+func startTURNServer(t *testing.T, allow bool) string {
+	t.Helper()
+	udp, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	server, err := turn.NewServer(turn.ServerConfig{
+		Realm: "test",
+		AuthHandler: func(ra *turn.RequestAttributes) (string, []byte, bool) {
+			return ra.Username, turn.GenerateAuthKey(ra.Username, ra.Realm, "pass"), allow
+		},
+		PacketConnConfigs: []turn.PacketConnConfig{{
+			PacketConn:            udp,
+			RelayAddressGenerator: &turn.RelayAddressGeneratorStatic{RelayAddress: net.ParseIP("127.0.0.1"), Address: "127.0.0.1"},
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = server.Close() })
+	return "turn:" + udp.LocalAddr().String() + "?transport=udp"
 }
