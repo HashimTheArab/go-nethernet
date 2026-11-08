@@ -440,7 +440,11 @@ func TestSignaledCandidateHidesRelayRelatedAddress(t *testing.T) {
 func TestRelayOnlyDialHidesLocalAddress(t *testing.T) {
 	turnURL := startTURNServer(t, true)
 	for _, bundled := range []bool{false, true} {
-		signaling := &recordingSignaling{id: "1", ctx: context.Background(), signals: make(chan *Signal, 64)}
+		// The TURN server arrives through AwaitCredentials, as from signaling that answers Credentials at once.
+		signaling := &awaitingSignaling{
+			recordingSignaling: recordingSignaling{id: "1", ctx: context.Background(), signals: make(chan *Signal, 64)},
+			servers:            []ICEServer{{Username: "user", Password: "pass", URLs: []string{turnURL}}},
+		}
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		done := make(chan struct{})
 		go func() {
@@ -448,9 +452,6 @@ func TestRelayOnlyDialHidesLocalAddress(t *testing.T) {
 			_, _ = (Dialer{
 				ICEGatherPolicy:   webrtc.ICETransportPolicyRelay,
 				DisableTrickleICE: bundled,
-				Credentials: func(context.Context) (*Credentials, error) {
-					return &Credentials{ICEServers: []ICEServer{{Username: "user", Password: "pass", URLs: []string{turnURL}}}}, nil
-				},
 			}).DialContext(ctx, "2", signaling)
 		}()
 		candidate := awaitRelayCandidate(ctx, signaling.signals)

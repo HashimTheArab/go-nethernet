@@ -71,7 +71,8 @@ type Dialer struct {
 	//
 	// It may be used to restrict connectivity to specific candidate types, such
 	// as relayed candidates from TURN servers only. A relay-only dial fails at once
-	// with [ErrNoTURNServer] when its credentials name no TURN server with a username.
+	// with [ErrNoTURNServer] when its credentials name no TURN server with a username,
+	// and with [ErrNoCandidates] when gathering finds no candidate.
 	ICEGatherPolicy webrtc.ICEGatherPolicy
 
 	// Credentials optionally supplies the ICE servers used for gathering local
@@ -210,7 +211,7 @@ func (d Dialer) DialContext(ctx context.Context, networkID string, signaling Sig
 		if err != nil {
 			return nil, fmt.Errorf("gather local candidates (non-trickle ICE): %w", err)
 		}
-		if len(c.description.Candidates) == 0 {
+		if relayOnly && len(c.description.Candidates) == 0 {
 			return nil, fmt.Errorf("gather local candidates (non-trickle ICE): %w", ErrNoCandidates)
 		}
 	}
@@ -240,7 +241,7 @@ func (d Dialer) DialContext(ctx context.Context, networkID string, signaling Sig
 	}
 
 	if !disableTrickleICE {
-		if err := c.trickleCandidates(signaling, true); err != nil {
+		if err := c.trickleCandidates(signaling, relayOnly); err != nil {
 			return nil, fmt.Errorf("start gathering local candidates: %w", err)
 		}
 	}

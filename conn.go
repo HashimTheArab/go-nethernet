@@ -795,8 +795,8 @@ func (conn *Conn) signaledCandidate(candidate webrtc.ICECandidate) webrtc.ICECan
 	return candidate
 }
 
-// ErrNoCandidates is returned by a dial whose gathering ends without a single local candidate, such as
-// relay-only gathering through a TURN server that refused the allocation.
+// ErrNoCandidates is returned by a relay-only dial whose gathering ends without a single candidate,
+// such as when the TURN server refused the allocation.
 var ErrNoCandidates = errors.New("nethernet: no local candidates were gathered")
 
 // trickleCandidates starts local ICE gathering for trickle ICE and signals each
