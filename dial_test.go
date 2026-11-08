@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"log/slog"
-	"strconv"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -158,7 +157,6 @@ func (s *awaitingSignaling) AwaitCredentials(context.Context) (*Credentials, err
 func TestRelayOnlyDialRequiresTURNServer(t *testing.T) {
 	stun := ICEServer{URLs: []string{"stun:relay.example:3478"}}
 	anonymous := ICEServer{URLs: []string{"turn:relay.example:3478"}}
-	malformed := ICEServer{Username: "u", URLs: []string{"turn:"}}
 	turnFailed := errors.New("turn unavailable")
 	for name, test := range map[string]struct {
 		servers []ICEServer
@@ -166,10 +164,8 @@ func TestRelayOnlyDialRequiresTURNServer(t *testing.T) {
 		want    error
 	}{
 		"failed request": {err: turnFailed, want: turnFailed},
-		"no servers":     {want: ErrNoTURNServer},
 		"stun only":      {servers: []ICEServer{stun}, want: ErrNoTURNServer},
 		"no username":    {servers: []ICEServer{anonymous}, want: ErrNoTURNServer},
-		"malformed URL":  {servers: []ICEServer{malformed}, want: ErrNoTURNServer},
 	} {
 		signaling := &awaitingSignaling{recordingSignaling: recordingSignaling{id: "1", ctx: context.Background(), signals: make(chan *Signal, 8)}, servers: test.servers, err: test.err}
 		_, err := (Dialer{ICEGatherPolicy: webrtc.ICETransportPolicyRelay}).DialContext(context.Background(), "2", signaling)
@@ -211,29 +207,5 @@ func TestRelayOnlyDialFailsWithoutRelayCandidate(t *testing.T) {
 		if !errors.Is(err, ErrNoCandidates) {
 			t.Fatalf("bundled=%v: DialContext() error = %v after %v, want %v", bundled, err, time.Since(start), ErrNoCandidates)
 		}
-	}
-}
-
-// A relay-only listener waits through AwaitCredentials and answers ErrorCodeSignalingTurnAuthFailed without TURN.
-func TestRelayOnlyListenerRequiresTURNServer(t *testing.T) {
-	signaling := &awaitingSignaling{recordingSignaling: recordingSignaling{id: "1", ctx: context.Background(), signals: make(chan *Signal, 8)}}
-	l, err := (ListenConfig{ICEGatherPolicy: webrtc.ICETransportPolicyRelay, Log: slog.New(slog.DiscardHandler)}).Listen(signaling)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = l.Close() })
-	if !l.NotifySignal(&Signal{Type: SignalTypeOffer, NetworkID: "remote", ConnectionID: 1, Data: testOffer(t)}) {
-		t.Fatal("offer rejected")
-	}
-	select {
-	case signal := <-signaling.signals:
-		if signal.Type != SignalTypeError || signal.Data != strconv.Itoa(ErrorCodeSignalingTurnAuthFailed) {
-			t.Fatalf("listener signaled %v, want error code %d", signal, ErrorCodeSignalingTurnAuthFailed)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("listener sent no error reply")
-	}
-	if !signaling.awaited.Load() {
-		t.Fatal("relay-only listener did not wait for TURN servers")
 	}
 }

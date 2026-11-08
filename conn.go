@@ -795,7 +795,7 @@ func (conn *Conn) signaledCandidate(candidate webrtc.ICECandidate) webrtc.ICECan
 	return candidate
 }
 
-// ErrNoCandidates is returned when gathering ends without a single local candidate, such as
+// ErrNoCandidates is returned by a dial whose gathering ends without a single local candidate, such as
 // relay-only gathering through a TURN server that refused the allocation.
 var ErrNoCandidates = errors.New("nethernet: no local candidates were gathered")
 

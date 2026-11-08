@@ -154,9 +154,21 @@ func (d Dialer) DialContext(ctx context.Context, networkID string, signaling Sig
 		}
 	}
 
-	credentials, err := gatherCredentials(ctx, signaling, d.Credentials, d.ICEGatherPolicy)
+	relayOnly := d.ICEGatherPolicy == webrtc.ICETransportPolicyRelay
+	credentialsFunc := signaling.Credentials
+	if awaiter, ok := signaling.(CredentialsAwaiter); ok && relayOnly {
+		// Relay-only gathering finds nothing without TURN servers, so wait for them.
+		credentialsFunc = awaiter.AwaitCredentials
+	}
+	if d.Credentials != nil {
+		credentialsFunc = d.Credentials
+	}
+	credentials, err := credentialsFunc(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("obtain credentials: %w", err)
+	}
+	if relayOnly && !hasTURNServer(credentials) {
+		return nil, ErrNoTURNServer
 	}
 
 	// Signals may be received very early when signaling an offer with local candidates.

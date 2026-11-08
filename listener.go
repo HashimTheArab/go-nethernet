@@ -446,7 +446,7 @@ func (n *listenerNegotiator) handleOffer(signal *Signal) error {
 		ctx, cancel = context.WithTimeout(parent, time.Second*15)
 		defer cancel()
 	}
-	credentials, err := gatherCredentials(ctx, n.signaling, nil, n.conf.ICEGatherPolicy)
+	credentials, err := n.signaling.Credentials(ctx)
 	if err != nil {
 		return wrapSignalError(fmt.Errorf("obtain credentials: %w", err), ErrorCodeSignalingTurnAuthFailed)
 	}
@@ -477,7 +477,7 @@ func (n *listenerNegotiator) handleOffer(signal *Signal) error {
 		}
 		if len(c.description.Candidates) == 0 {
 			// We may have run out of UDP ports configured in the WebRTC API.
-			return wrapSignalError(ErrNoCandidates, ErrorCodeICE)
+			return wrapSignalError(errors.New("no local candidates were gathered"), ErrorCodeICE)
 		}
 	}
 	for _, candidate := range desc.Candidates {
