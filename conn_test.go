@@ -9,8 +9,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/pion/turn/v5"
 	"github.com/pion/sdp/v3"
+	"github.com/pion/turn/v5"
 	"github.com/pion/webrtc/v4"
 )
 
@@ -457,29 +457,44 @@ func TestRelayOnlyDialHidesLocalAddress(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = server.Close() })
 
-	signaling := &recordingSignaling{id: "1", ctx: context.Background(), signals: make(chan *Signal, 64)}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	go func() {
-		_, _ = (Dialer{
-			ICEGatherPolicy: webrtc.ICETransportPolicyRelay,
-			Credentials: func(context.Context) (*Credentials, error) {
-				return &Credentials{ICEServers: []ICEServer{{Username: "user", Password: "pass", URLs: []string{"turn:" + udp.LocalAddr().String() + "?transport=udp"}}}}, nil
-			},
-		}).DialContext(ctx, "2", signaling)
-	}()
+	for _, bundled := range []bool{false, true} {
+		signaling := &recordingSignaling{id: "1", ctx: context.Background(), signals: make(chan *Signal, 64)}
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			_, _ = (Dialer{
+				ICEGatherPolicy:   webrtc.ICETransportPolicyRelay,
+				DisableTrickleICE: bundled,
+				Credentials: func(context.Context) (*Credentials, error) {
+					return &Credentials{ICEServers: []ICEServer{{Username: "user", Password: "pass", URLs: []string{"turn:" + udp.LocalAddr().String() + "?transport=udp"}}}}, nil
+				},
+			}).DialContext(ctx, "2", signaling)
+		}()
+		candidate := awaitRelayCandidate(ctx, signaling.signals)
+		cancel()
+		<-done
+		if candidate == "" {
+			t.Fatalf("bundled=%v: no relay candidate was signaled", bundled)
+		}
+		if !strings.Contains(candidate, "raddr 0.0.0.0 rport 0") {
+			t.Fatalf("bundled=%v: relay candidate %q names a local address", bundled, candidate)
+		}
+	}
+}
+
+// awaitRelayCandidate returns the first relay candidate line a dial signals, trickled or in its offer.
+func awaitRelayCandidate(ctx context.Context, signals <-chan *Signal) string {
 	for {
 		select {
-		case signal := <-signaling.signals:
-			if signal.Type != SignalTypeCandidate || !strings.Contains(signal.Data, "typ relay") {
-				continue
+		case signal := <-signals:
+			for _, line := range strings.Split(signal.Data, "\n") {
+				if strings.Contains(line, "typ relay") {
+					return strings.TrimSpace(line)
+				}
 			}
-			if !strings.Contains(signal.Data, "raddr 0.0.0.0 rport 0") {
-				t.Fatalf("relay candidate %q names a local address", signal.Data)
-			}
-			return
 		case <-ctx.Done():
-			t.Fatal("no relay candidate was signaled")
+			return ""
 		}
 	}
 }

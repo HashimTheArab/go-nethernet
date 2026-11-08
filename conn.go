@@ -782,15 +782,14 @@ func (conn *Conn) gatherCandidates(ctx context.Context) ([]webrtc.ICECandidate, 
 	}
 }
 
-// signaledCandidate returns a local candidate as it is signaled to the remote peer. When gathering is
-// relay-only, a relay candidate's related address, the local address the relay was allocated from,
-// is left empty, as libwebrtc does, so it cannot show the address relay-only gathering hides.
+// signaledCandidate returns a local candidate as signaled to the remote peer: relay-only gathering
+// blanks a relay candidate's related address, the local one it was allocated from, as libwebrtc does.
 func (conn *Conn) signaledCandidate(candidate webrtc.ICECandidate) webrtc.ICECandidate {
 	if !conn.relayOnly || candidate.Typ != webrtc.ICECandidateTypeRelay {
 		return candidate
 	}
 	candidate.RelatedAddress, candidate.RelatedPort = "0.0.0.0", 0
-	if ip, err := netip.ParseAddr(candidate.Address); err == nil && ip.Is6() && !ip.Is4In6() {
+	if ip, err := netip.ParseAddr(candidate.Address); err == nil && ip.Is6() {
 		candidate.RelatedAddress = "::"
 	}
 	return candidate
