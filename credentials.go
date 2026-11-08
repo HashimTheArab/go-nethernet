@@ -22,12 +22,8 @@ type ICEServer struct {
 	URLs     []string `json:"Urls"`
 }
 
-var (
-	// errNoTURNServer reports relay-only gathering with no TURN server it can authenticate to.
-	errNoTURNServer = errors.New("relay-only gathering: no TURN server with a username")
-	// errNoCandidates reports gathering that finished without a single local candidate.
-	errNoCandidates = errors.New("no local candidates were gathered")
-)
+// ErrNoTURNServer is returned by relay-only gathering whose Credentials name no TURN server with a username.
+var ErrNoTURNServer = errors.New("relay-only gathering: no TURN server with a username")
 
 // hasTURNServer reports whether credentials name a TURN server with a username.
 func hasTURNServer(credentials *Credentials) bool {

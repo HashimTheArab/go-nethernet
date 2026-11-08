@@ -451,7 +451,7 @@ func (n *listenerNegotiator) handleOffer(signal *Signal) error {
 		return wrapSignalError(fmt.Errorf("obtain credentials: %w", err), ErrorCodeSignalingTurnAuthFailed)
 	}
 	if n.conf.ICEGatherPolicy == webrtc.ICETransportPolicyRelay && !hasTURNServer(credentials) {
-		return wrapSignalError(errNoTURNServer, ErrorCodeSignalingTurnAuthFailed)
+		return wrapSignalError(ErrNoTURNServer, ErrorCodeSignalingTurnAuthFailed)
 	}
 
 	c, err := newConn(
@@ -480,7 +480,7 @@ func (n *listenerNegotiator) handleOffer(signal *Signal) error {
 		}
 		if len(c.description.Candidates) == 0 {
 			// We may have run out of UDP ports configured in the WebRTC API.
-			return wrapSignalError(errNoCandidates, ErrorCodeICE)
+			return wrapSignalError(ErrNoCandidates, ErrorCodeICE)
 		}
 	}
 	for _, candidate := range desc.Candidates {
@@ -565,7 +565,7 @@ func (n *listenerNegotiator) handleOffer(signal *Signal) error {
 	}
 
 	if !disableTrickleICE {
-		if err := c.trickleCandidates(n.signaling); err != nil {
+		if err := c.trickleCandidates(n.signaling, false); err != nil {
 			return wrapSignalError(fmt.Errorf("start gathering local candidates: %w", err), ErrorCodeFailedToCreatePeerConnection)
 		}
 	}

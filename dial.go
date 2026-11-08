@@ -164,7 +164,7 @@ func (d Dialer) DialContext(ctx context.Context, networkID string, signaling Sig
 		return nil, fmt.Errorf("obtain credentials: %w", err)
 	}
 	if d.ICEGatherPolicy == webrtc.ICETransportPolicyRelay && !hasTURNServer(credentials) {
-		return nil, errNoTURNServer
+		return nil, ErrNoTURNServer
 	}
 
 	// Signals may be received very early when signaling an offer with local candidates.
@@ -207,7 +207,7 @@ func (d Dialer) DialContext(ctx context.Context, networkID string, signaling Sig
 			return nil, fmt.Errorf("gather local candidates (non-trickle ICE): %w", err)
 		}
 		if len(c.description.Candidates) == 0 {
-			return nil, errNoCandidates
+			return nil, fmt.Errorf("gather local candidates (non-trickle ICE): %w", ErrNoCandidates)
 		}
 	}
 
@@ -236,7 +236,7 @@ func (d Dialer) DialContext(ctx context.Context, networkID string, signaling Sig
 	}
 
 	if !disableTrickleICE {
-		if err := c.trickleCandidates(signaling); err != nil {
+		if err := c.trickleCandidates(signaling, true); err != nil {
 			return nil, fmt.Errorf("start gathering local candidates: %w", err)
 		}
 	}

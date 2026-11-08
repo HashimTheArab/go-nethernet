@@ -795,21 +795,27 @@ func (conn *Conn) signaledCandidate(candidate webrtc.ICECandidate) webrtc.ICECan
 	return candidate
 }
 
+// ErrNoCandidates is returned by a dial whose gathering ended without a single local candidate, such
+// as relay-only gathering through a TURN server that refused the allocation.
+var ErrNoCandidates = errors.New("no local candidates were gathered")
+
 // trickleCandidates starts local ICE gathering for trickle ICE and signals each
 // discovered candidate to the remote peer through signaling.
 //
 // It must be called after the local offer or answer has been signaled, because
 // candidates are sent as separate [SignalTypeCandidate] messages instead of
-// being embedded in the SDP.
-func (conn *Conn) trickleCandidates(signaling Signaling) error {
+// being embedded in the SDP. With closeIfNone, gathering that ends without a
+// candidate closes the Conn with [ErrNoCandidates].
+func (conn *Conn) trickleCandidates(signaling Signaling, closeIfNone bool) error {
 	var candidateIndex atomic.Uint32 // incremented when allocating 'network-id' for each candidate
 	conn.gatherer.OnLocalCandidate(func(candidate *webrtc.ICECandidate) {
 		// ICEGatherer already tracks its internal state, so we don't need to check if the connection is closed.
 		if candidate == nil {
 			conn.log.Debug("end of candidate")
-			if candidateIndex.Load() == 0 {
-				// Nothing was signaled, so the remote peer can never reach us.
-				_ = conn.close(errNoCandidates)
+			if closeIfNone && candidateIndex.Load() == 0 {
+				// Nothing was signaled, so the remote peer can never reach us. Closing inside
+				// the gatherer callback could deadlock pion.
+				go conn.close(ErrNoCandidates)
 			}
 			return
 		}

@@ -30,10 +30,10 @@ type Signaling interface {
 	// a fatal error so they can no longer listen or dial for a connection that is no longer notified.
 	Context() context.Context
 
-	// Credentials blocks until Credentials are received by Signaling, and returns them. If Signaling
-	// does not support returning Credentials, it will return nil. Credentials are typically received
-	// from a WebSocket connection. The [context.Context] may be used to cancel the blocking.
-	// Credentials may be called concurrently for different connections.
+	// Credentials returns the Credentials to gather local candidates with, or nil if Signaling does
+	// not support them. Credentials are typically received from a WebSocket connection; Signaling may
+	// block until they arrive, or answer at once with none and implement [CredentialsAwaiter]. The
+	// [context.Context] may be used to cancel the blocking. Credentials may be called concurrently.
 	Credentials(ctx context.Context) (*Credentials, error)
 
 	// NetworkID returns the local network ID of Signaling. It is used by Listener to obtain its local
@@ -61,17 +61,18 @@ type trickleICEDisabler interface {
 	DisableTrickleICE() bool
 }
 
-// credentialsAwaiter is implemented by Signaling whose Credentials answers at once, possibly with no
-// servers, while a TURN request is in flight.
-type credentialsAwaiter interface {
-	// AwaitCredentials returns the answer to the TURN request in flight, or its error.
+// CredentialsAwaiter is implemented by Signaling whose Credentials answers at once, possibly with no
+// servers, while a request for them is in flight. Relay-only gathering waits through it instead.
+type CredentialsAwaiter interface {
+	// AwaitCredentials returns Credentials that have not expired, waiting for a request if needed,
+	// or the error of that request.
 	AwaitCredentials(ctx context.Context) (*Credentials, error)
 }
 
 // gatherCredentials returns the Credentials to gather with. Relay-only gathering finds nothing
-// without TURN servers, so it waits for them on Signaling implementing [credentialsAwaiter].
+// without TURN servers, so it waits for them on Signaling implementing [CredentialsAwaiter].
 func gatherCredentials(ctx context.Context, signaling Signaling, policy webrtc.ICEGatherPolicy) (*Credentials, error) {
-	if awaiter, ok := signaling.(credentialsAwaiter); ok && policy == webrtc.ICETransportPolicyRelay {
+	if awaiter, ok := signaling.(CredentialsAwaiter); ok && policy == webrtc.ICETransportPolicyRelay {
 		return awaiter.AwaitCredentials(ctx)
 	}
 	return signaling.Credentials(ctx)
