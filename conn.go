@@ -46,6 +46,8 @@ type Conn struct {
 	dtls     *webrtc.DTLSTransport
 	sctp     *webrtc.SCTPTransport
 	gatherer *webrtc.ICEGatherer
+	// relayOnly reports that the gatherer gathers only relay candidates.
+	relayOnly bool
 
 	// description is the local session description for the Conn.
 	// newConn builds it from the local parameters of each underlying transport.
@@ -765,7 +767,7 @@ func (conn *Conn) gatherCandidates(ctx context.Context) ([]webrtc.ICECandidate, 
 			close(complete)
 			return
 		}
-		candidates = append(candidates, *candidate)
+		candidates = append(candidates, conn.signaledCandidate(*candidate))
 	})
 	if err := conn.gatherer.Gather(); err != nil {
 		return nil, fmt.Errorf("start gathering local candidates: %w", err)
@@ -778,6 +780,20 @@ func (conn *Conn) gatherCandidates(ctx context.Context) ([]webrtc.ICECandidate, 
 	case <-conn.ctx.Done():
 		return nil, context.Cause(conn.ctx)
 	}
+}
+
+// signaledCandidate returns a local candidate as it is signaled to the remote peer. When gathering is
+// relay-only, a relay candidate's related address, the local address the relay was allocated from,
+// is left empty, as libwebrtc does, so it cannot show the address relay-only gathering hides.
+func (conn *Conn) signaledCandidate(candidate webrtc.ICECandidate) webrtc.ICECandidate {
+	if !conn.relayOnly || candidate.Typ != webrtc.ICECandidateTypeRelay {
+		return candidate
+	}
+	candidate.RelatedAddress, candidate.RelatedPort = "0.0.0.0", 0
+	if ip, err := netip.ParseAddr(candidate.Address); err == nil && ip.Is6() && !ip.Is4In6() {
+		candidate.RelatedAddress = "::"
+	}
+	return candidate
 }
 
 // trickleCandidates starts local ICE gathering for trickle ICE and signals each
@@ -796,7 +812,7 @@ func (conn *Conn) trickleCandidates(signaling Signaling) error {
 		}
 		// Signal the local candidate in a goroutine so candidate gathering is never blocked by signaling.
 		// It uses [Conn.Context] as the parent context so signaling stops once the connection is closed.
-		go conn.trickleCandidate(signaling, formatICECandidate(int(candidateIndex.Add(1)-1), *candidate, conn.description.ICE, true))
+		go conn.trickleCandidate(signaling, formatICECandidate(int(candidateIndex.Add(1)-1), conn.signaledCandidate(*candidate), conn.description.ICE, true))
 	})
 	return conn.gatherer.Gather()
 }
@@ -1029,10 +1045,11 @@ func newConn(api *webrtc.API, gathererOpts webrtc.ICEGatherOptions, id uint64, n
 	sctpCapabilities := sctpTransport.GetCapabilities()
 
 	c := &Conn{
-		ice:      iceTransport,
-		dtls:     dtlsTransport,
-		sctp:     sctpTransport,
-		gatherer: gatherer,
+		ice:       iceTransport,
+		dtls:      dtlsTransport,
+		sctp:      sctpTransport,
+		gatherer:  gatherer,
+		relayOnly: gathererOpts.ICEGatherPolicy == webrtc.ICETransportPolicyRelay,
 
 		description: &Description{
 			ICE:  iceParams,

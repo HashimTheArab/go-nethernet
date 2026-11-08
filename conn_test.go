@@ -5,9 +5,11 @@ import (
 	"errors"
 	"net"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/pion/turn/v5"
 	"github.com/pion/sdp/v3"
 	"github.com/pion/webrtc/v4"
 )
@@ -400,5 +402,84 @@ func TestLatencyExcludesDelayedAcknowledgement(t *testing.T) {
 	const limit = interval / 5
 	if latency := clientConn.Latency(); latency <= 0 || latency >= limit {
 		t.Fatalf("Latency() = %v, want within (0, %v); SCTP SRTT is %.1fms", latency, limit, clientConn.sctp.Stats().SmoothedRoundTripTime*1000)
+	}
+}
+
+// Relay-only gathering signals relay candidates without the local address they were allocated from.
+func TestSignaledCandidateHidesRelayRelatedAddress(t *testing.T) {
+	t.Parallel()
+	relay := webrtc.ICECandidate{Foundation: "1", Protocol: webrtc.ICEProtocolUDP, Address: "203.0.113.7", Port: 50000, Typ: webrtc.ICECandidateTypeRelay, RelatedAddress: "198.51.100.20", RelatedPort: 41000}
+	relay6 := relay
+	relay6.Address = "2001:db8::7"
+	srflx := relay
+	srflx.Typ = webrtc.ICECandidateTypeSrflx
+
+	for name, test := range map[string]struct {
+		relayOnly   bool
+		candidate   webrtc.ICECandidate
+		wantAddress string
+		wantPort    uint16
+	}{
+		"relay-only IPv4 relay": {true, relay, "0.0.0.0", 0},
+		"relay-only IPv6 relay": {true, relay6, "::", 0},
+		"all-candidate relay":   {false, relay, "198.51.100.20", 41000},
+		"relay-only srflx":      {true, srflx, "198.51.100.20", 41000},
+	} {
+		got := (&Conn{relayOnly: test.relayOnly}).signaledCandidate(test.candidate)
+		if got.RelatedAddress != test.wantAddress || got.RelatedPort != test.wantPort {
+			t.Errorf("%s: related address = %s:%d, want %s:%d", name, got.RelatedAddress, got.RelatedPort, test.wantAddress, test.wantPort)
+		}
+	}
+	line := formatICECandidate(0, (&Conn{relayOnly: true}).signaledCandidate(relay), webrtc.ICEParameters{UsernameFragment: "u"}, true)
+	if !strings.Contains(line, "raddr 0.0.0.0 rport 0") || strings.Contains(line, "198.51.100.20") {
+		t.Fatalf("signaled candidate %q still names the local address", line)
+	}
+}
+
+// A relay-only dial through a TURN server signals its relay candidates without the local address.
+func TestRelayOnlyDialHidesLocalAddress(t *testing.T) {
+	udp, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	server, err := turn.NewServer(turn.ServerConfig{
+		Realm: "test",
+		AuthHandler: func(ra *turn.RequestAttributes) (string, []byte, bool) {
+			return ra.Username, turn.GenerateAuthKey(ra.Username, ra.Realm, "pass"), true
+		},
+		PacketConnConfigs: []turn.PacketConnConfig{{
+			PacketConn:            udp,
+			RelayAddressGenerator: &turn.RelayAddressGeneratorStatic{RelayAddress: net.ParseIP("127.0.0.1"), Address: "127.0.0.1"},
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = server.Close() })
+
+	signaling := &recordingSignaling{id: "1", ctx: context.Background(), signals: make(chan *Signal, 64)}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	go func() {
+		_, _ = (Dialer{
+			ICEGatherPolicy: webrtc.ICETransportPolicyRelay,
+			Credentials: func(context.Context) (*Credentials, error) {
+				return &Credentials{ICEServers: []ICEServer{{Username: "user", Password: "pass", URLs: []string{"turn:" + udp.LocalAddr().String() + "?transport=udp"}}}}, nil
+			},
+		}).DialContext(ctx, "2", signaling)
+	}()
+	for {
+		select {
+		case signal := <-signaling.signals:
+			if signal.Type != SignalTypeCandidate || !strings.Contains(signal.Data, "typ relay") {
+				continue
+			}
+			if !strings.Contains(signal.Data, "raddr 0.0.0.0 rport 0") {
+				t.Fatalf("relay candidate %q names a local address", signal.Data)
+			}
+			return
+		case <-ctx.Done():
+			t.Fatal("no relay candidate was signaled")
+		}
 	}
 }
