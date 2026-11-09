@@ -562,7 +562,7 @@ func (n *listenerNegotiator) handleOffer(signal *Signal) error {
 	}
 
 	if !disableTrickleICE {
-		if err := c.trickleCandidates(n.signaling, false); err != nil {
+		if err := c.trickleCandidates(n.signaling); err != nil {
 			return wrapSignalError(fmt.Errorf("start gathering local candidates: %w", err), ErrorCodeFailedToCreatePeerConnection)
 		}
 	}

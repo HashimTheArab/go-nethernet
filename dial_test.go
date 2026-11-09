@@ -157,6 +157,7 @@ func (s *awaitingSignaling) AwaitCredentials(context.Context) (*Credentials, err
 func TestRelayOnlyDialRequiresTURNServer(t *testing.T) {
 	stun := ICEServer{URLs: []string{"stun:relay.example:3478"}}
 	anonymous := ICEServer{URLs: []string{"turn:relay.example:3478"}}
+	noPassword := ICEServer{Username: "user", URLs: []string{"turn:relay.example:3478"}}
 	turnFailed := errors.New("turn unavailable")
 	for name, test := range map[string]struct {
 		servers []ICEServer
@@ -166,18 +167,21 @@ func TestRelayOnlyDialRequiresTURNServer(t *testing.T) {
 		"failed request": {err: turnFailed, want: turnFailed},
 		"stun only":      {servers: []ICEServer{stun}, want: ErrNoTURNServer},
 		"no username":    {servers: []ICEServer{anonymous}, want: ErrNoTURNServer},
+		"no password":    {servers: []ICEServer{noPassword}, want: ErrNoTURNServer},
 	} {
-		signaling := &awaitingSignaling{recordingSignaling: recordingSignaling{id: "1", ctx: context.Background(), signals: make(chan *Signal, 8)}, servers: test.servers, err: test.err}
-		_, err := (Dialer{ICEGatherPolicy: webrtc.ICETransportPolicyRelay}).DialContext(context.Background(), "2", signaling)
-		if !errors.Is(err, test.want) {
-			t.Fatalf("%s: DialContext() error = %v, want %v", name, err, test.want)
-		}
-		if len(signaling.signals) != 0 {
-			t.Fatalf("%s: dial signaled an offer", name)
-		}
-		if !signaling.awaited.Load() {
-			t.Fatalf("%s: relay-only dial did not wait through AwaitCredentials", name)
-		}
+		t.Run(name, func(t *testing.T) {
+			signaling := &awaitingSignaling{recordingSignaling: recordingSignaling{id: "1", ctx: context.Background(), signals: make(chan *Signal, 8)}, servers: test.servers, err: test.err}
+			_, err := (Dialer{ICEGatherPolicy: webrtc.ICETransportPolicyRelay}).DialContext(context.Background(), "2", signaling)
+			if !errors.Is(err, test.want) {
+				t.Fatalf("DialContext() error = %v, want %v", err, test.want)
+			}
+			if len(signaling.signals) != 0 {
+				t.Fatal("dial signaled an offer")
+			}
+			if !signaling.awaited.Load() {
+				t.Fatal("relay-only dial did not wait through AwaitCredentials")
+			}
+		})
 	}
 
 	signaling := &awaitingSignaling{recordingSignaling: recordingSignaling{id: "1", ctx: context.Background(), signals: make(chan *Signal, 8)}}
