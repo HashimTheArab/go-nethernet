@@ -1,6 +1,12 @@
 package nethernet
 
-import "github.com/pion/webrtc/v4"
+import (
+	"errors"
+	"slices"
+
+	"github.com/pion/stun/v4"
+	"github.com/pion/webrtc/v4"
+)
 
 // Credentials holds the configuration for ICE servers used for gathering local ICE candidates.
 type Credentials struct {
@@ -14,6 +20,19 @@ type ICEServer struct {
 	Username string   `json:"Username"`
 	Password string   `json:"Password"`
 	URLs     []string `json:"Urls"`
+}
+
+// ErrNoTURNServer is returned by relay-only gathering whose Credentials name no TURN server with a username and password.
+var ErrNoTURNServer = errors.New("nethernet: relay-only gathering: no TURN server with a username and password")
+
+// hasTURNServer reports whether credentials name a TURN server with a username and password.
+func hasTURNServer(credentials *Credentials) bool {
+	return credentials != nil && slices.ContainsFunc(credentials.ICEServers, func(server ICEServer) bool {
+		return server.Username != "" && server.Password != "" && slices.ContainsFunc(server.URLs, func(u string) bool {
+			uri, err := stun.ParseURI(u)
+			return err == nil && (uri.Scheme == stun.SchemeTypeTURN || uri.Scheme == stun.SchemeTypeTURNS)
+		})
+	})
 }
 
 // gatherOptions transforms the given Credentials and gather policy into a

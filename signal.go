@@ -30,10 +30,10 @@ type Signaling interface {
 	// a fatal error so they can no longer listen or dial for a connection that is no longer notified.
 	Context() context.Context
 
-	// Credentials blocks until Credentials are received by Signaling, and returns them. If Signaling
-	// does not support returning Credentials, it will return nil. Credentials are typically received
-	// from a WebSocket connection. The [context.Context] may be used to cancel the blocking.
-	// Credentials may be called concurrently for different connections.
+	// Credentials returns the Credentials to gather local candidates with, or nil if Signaling does
+	// not support them. Credentials are typically received from a WebSocket connection; Signaling may
+	// block until they arrive, or answer at once with none and implement [CredentialsAwaiter]. The
+	// [context.Context] may be used to cancel the blocking. Credentials may be called concurrently.
 	Credentials(ctx context.Context) (*Credentials, error)
 
 	// NetworkID returns the local network ID of Signaling. It is used by Listener to obtain its local
@@ -59,6 +59,13 @@ type trickleICEDisabler interface {
 	// DisableTrickleICE returns a boolean indicating whether Trickle ICE
 	// should be disabled for establishing peer connections with remote network.
 	DisableTrickleICE() bool
+}
+
+// CredentialsAwaiter is implemented by Signaling whose Credentials may answer at once with no servers
+// while a request for them is in flight. A relay-only Dialer waits through it instead.
+type CredentialsAwaiter interface {
+	// AwaitCredentials returns unexpired Credentials, waiting for a request if needed, or its error.
+	AwaitCredentials(ctx context.Context) (*Credentials, error)
 }
 
 // shouldDisableTrickleICE determines whether Trickle ICE should be disabled

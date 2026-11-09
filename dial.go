@@ -70,7 +70,9 @@ type Dialer struct {
 	// connection.
 	//
 	// It may be used to restrict connectivity to specific candidate types, such
-	// as relayed candidates from TURN servers only.
+	// as relayed candidates from TURN servers only. A relay-only dial fails at once
+	// with [ErrNoTURNServer] when its credentials name no TURN server with a username and password,
+	// and with [ErrNoCandidates] when gathering finds no candidate.
 	ICEGatherPolicy webrtc.ICEGatherPolicy
 
 	// Credentials optionally supplies the ICE servers used for gathering local
@@ -153,13 +155,21 @@ func (d Dialer) DialContext(ctx context.Context, networkID string, signaling Sig
 		}
 	}
 
+	relayOnly := d.ICEGatherPolicy == webrtc.ICETransportPolicyRelay
 	credentialsFunc := signaling.Credentials
+	if awaiter, ok := signaling.(CredentialsAwaiter); ok && relayOnly {
+		// Relay-only gathering finds nothing without TURN servers, so wait for them.
+		credentialsFunc = awaiter.AwaitCredentials
+	}
 	if d.Credentials != nil {
 		credentialsFunc = d.Credentials
 	}
 	credentials, err := credentialsFunc(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("obtain credentials: %w", err)
+	}
+	if relayOnly && !hasTURNServer(credentials) {
+		return nil, ErrNoTURNServer
 	}
 
 	// Signals may be received very early when signaling an offer with local candidates.
@@ -200,6 +210,9 @@ func (d Dialer) DialContext(ctx context.Context, networkID string, signaling Sig
 		c.description.Candidates, err = c.gatherCandidates(ctx)
 		if err != nil {
 			return nil, fmt.Errorf("gather local candidates (non-trickle ICE): %w", err)
+		}
+		if c.relayOnly && len(c.description.Candidates) == 0 {
+			return nil, fmt.Errorf("gather local candidates (non-trickle ICE): %w", ErrNoCandidates)
 		}
 	}
 
