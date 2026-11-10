@@ -5,8 +5,8 @@ import (
 	"errors"
 	"net"
 	"runtime"
-	"strings"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
