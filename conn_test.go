@@ -6,6 +6,7 @@ import (
 	"net"
 	"runtime"
 	"strings"
+	"slices"
 	"testing"
 	"time"
 
@@ -355,6 +356,43 @@ func TestDescriptionEncodeKeepsDummyAddressForHostnameCandidate(t *testing.T) {
 	}
 	if got := media.ConnectionInformation.Address.Address; got != "0.0.0.0" {
 		t.Fatalf("connection address = %q, want 0.0.0.0", got)
+	}
+}
+
+// Transport attributes may sit at the session level, and a media-level value takes precedence.
+func TestParseDescriptionReadsSessionLevelTransportAttributes(t *testing.T) {
+	session := []sdp.Attribute{
+		{Key: "ice-ufrag", Value: "session-ufrag"},
+		{Key: "ice-pwd", Value: "session-pwd"},
+		{Key: "fingerprint", Value: "sha-256 AA:BB"},
+		{Key: "setup", Value: "active"},
+	}
+	media := []sdp.Attribute{{Key: "max-message-size", Value: "262144"}}
+
+	desc, err := ParseDescription(&sdp.SessionDescription{
+		Attributes:        session,
+		MediaDescriptions: []*sdp.MediaDescription{{Attributes: media}},
+	})
+	if err != nil {
+		t.Fatalf("ParseDescription: %v", err)
+	}
+	if desc.ICE.UsernameFragment != "session-ufrag" || desc.ICE.Password != "session-pwd" {
+		t.Fatalf("ICE parameters = %+v, want the session-level values", desc.ICE)
+	}
+	if desc.DTLS.Role != webrtc.DTLSRoleClient || desc.DTLS.Fingerprints[0].Value != "AA:BB" {
+		t.Fatalf("DTLS parameters = %+v, want the session-level values", desc.DTLS)
+	}
+
+	overridden := append(slices.Clone(media), sdp.Attribute{Key: "ice-ufrag", Value: "media-ufrag"})
+	desc, err = ParseDescription(&sdp.SessionDescription{
+		Attributes:        session,
+		MediaDescriptions: []*sdp.MediaDescription{{Attributes: overridden}},
+	})
+	if err != nil {
+		t.Fatalf("ParseDescription: %v", err)
+	}
+	if desc.ICE.UsernameFragment != "media-ufrag" {
+		t.Fatalf("ice-ufrag = %q, want the media-level value", desc.ICE.UsernameFragment)
 	}
 }
 

@@ -653,21 +653,18 @@ func ParseDescription(d *sdp.SessionDescription) (*Description, error) {
 	}
 	m := d.MediaDescriptions[0]
 
-	ufrag, ok := m.Attribute("ice-ufrag")
+	ufrag, ok := descriptionAttribute(d, m, "ice-ufrag")
 	if !ok {
 		return nil, errors.New("missing ice-ufrag attribute")
 	}
-	pwd, ok := m.Attribute("ice-pwd")
+	pwd, ok := descriptionAttribute(d, m, "ice-pwd")
 	if !ok {
 		return nil, errors.New("missing ice-pwd attribute")
 	}
 
-	attr, ok := m.Attribute("fingerprint")
+	attr, ok := descriptionAttribute(d, m, "fingerprint")
 	if !ok {
-		attr, ok = d.Attribute("fingerprint")
-		if !ok {
-			return nil, errors.New("missing fingerprint attribute")
-		}
+		return nil, errors.New("missing fingerprint attribute")
 	}
 	fingerprint := strings.Split(attr, " ")
 	if len(fingerprint) != 2 {
@@ -689,7 +686,7 @@ func ParseDescription(d *sdp.SessionDescription) (*Description, error) {
 		}
 	}
 
-	attr, ok = m.Attribute("setup")
+	attr, ok = descriptionAttribute(d, m, "setup")
 	if !ok {
 		return nil, errors.New("missing setup attribute")
 	}
@@ -749,6 +746,14 @@ func ParseDescription(d *sdp.SessionDescription) (*Description, error) {
 		Identity:   identity,
 		Candidates: candidates,
 	}, nil
+}
+
+// descriptionAttribute returns the media-level value of key, or the session-level one libwebrtc also accepts.
+func descriptionAttribute(d *sdp.SessionDescription, m *sdp.MediaDescription, key string) (string, bool) {
+	if value, ok := m.Attribute(key); ok {
+		return value, true
+	}
+	return d.Attribute(key)
 }
 
 // gatherCandidates blocks until local ICE gathering completes and returns every
