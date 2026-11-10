@@ -269,6 +269,7 @@ func (d Dialer) DialContext(ctx context.Context, networkID string, signaling Sig
 				}
 				desc, err := ParseDescription(s)
 				if err != nil {
+					d.Log.Debug("unusable answer", "error", err, "session_attributes", attributeKeys(s.Attributes), "media_sections", len(s.MediaDescriptions), "media_attributes", answerMediaKeys(s))
 					return nil, fmt.Errorf("parse answer: %w", err)
 				}
 				if desc.Identity != nil {

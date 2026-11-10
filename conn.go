@@ -702,13 +702,12 @@ func ParseDescription(d *sdp.SessionDescription) (*Description, error) {
 		return nil, fmt.Errorf("invalid setup attribute: %s", attr)
 	}
 
-	attr, ok = m.Attribute("max-message-size")
-	if !ok {
-		return nil, errors.New("missing max-message-size attribute")
-	}
-	maxMessageSize, err := strconv.ParseUint(attr, 10, 32)
-	if err != nil {
-		return nil, fmt.Errorf("parse max-message-size attribute as uint32: %w", err)
+	maxMessageSize := uint64(defaultSCTPMaxMessageSize)
+	if attr, ok = m.Attribute("max-message-size"); ok {
+		var err error
+		if maxMessageSize, err = strconv.ParseUint(attr, 10, 32); err != nil {
+			return nil, fmt.Errorf("parse max-message-size attribute as uint32: %w", err)
+		}
 	}
 	if maxMessageSize <= 1 {
 		return nil, fmt.Errorf("max-message-size attribute must exceed one byte: %d", maxMessageSize)
@@ -748,12 +747,33 @@ func ParseDescription(d *sdp.SessionDescription) (*Description, error) {
 	}, nil
 }
 
-// descriptionAttribute returns the media-level value of key, or the session-level one libwebrtc also accepts.
+// defaultSCTPMaxMessageSize is the size RFC 8841 assumes when a description has no max-message-size.
+const defaultSCTPMaxMessageSize = 65536
+
+// descriptionAttribute returns the non-empty media-level value of key, or the session-level one libwebrtc also accepts.
 func descriptionAttribute(d *sdp.SessionDescription, m *sdp.MediaDescription, key string) (string, bool) {
-	if value, ok := m.Attribute(key); ok {
-		return value, true
+	value, ok := m.Attribute(key)
+	if !ok || value == "" {
+		value, _ = d.Attribute(key)
 	}
-	return d.Attribute(key)
+	return value, value != ""
+}
+
+// attributeKeys returns the keys of attrs, without their values, for diagnosing an unusable description.
+func attributeKeys(attrs []sdp.Attribute) []string {
+	keys := make([]string, len(attrs))
+	for i, attr := range attrs {
+		keys[i] = attr.Key
+	}
+	return keys
+}
+
+// answerMediaKeys returns the attribute keys of the first media section, if there is one.
+func answerMediaKeys(d *sdp.SessionDescription) []string {
+	if len(d.MediaDescriptions) == 0 {
+		return nil
+	}
+	return attributeKeys(d.MediaDescriptions[0].Attributes)
 }
 
 // gatherCandidates blocks until local ICE gathering completes and returns every
