@@ -31,7 +31,7 @@ type ListenConfig struct {
 	Log *slog.Logger
 
 	// API specifies custom configuration for WebRTC transports and data channels. If nil, a new [webrtc.API] will
-	// be set from [webrtc.NewAPI]. The [webrtc.SettingEngine] of the API should not allow detaching data channels,
+	// be built from [NewSettingEngine]. The [webrtc.SettingEngine] of the API should not allow detaching data channels,
 	// as it requires additional steps on the Conn (which cannot be determined by the Conn).
 	API *webrtc.API
 
@@ -146,7 +146,7 @@ func (conf ListenConfig) Listen(signaling Signaling) (*Listener, error) {
 		conf.Log = slog.Default()
 	}
 	if conf.API == nil {
-		conf.API = webrtc.NewAPI()
+		conf.API = newAPI()
 	}
 	if conf.IssueServerIdentity == nil {
 		conf.Log.Warn("generating a new private key for this listener. a TOFU (Trust on First Use) prompt may be surfaced to players on first join")
