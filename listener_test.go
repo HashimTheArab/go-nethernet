@@ -160,7 +160,7 @@ func TestListenerNonTrickleGatheringDoesNotBlockOtherOffers(t *testing.T) {
 	t.Cleanup(base.close)
 	responses := make(chan Signal, 4)
 	signaling := &firstOfferSTUNSignaling{Signaling: listenerResponseSignaling{base, responses}, url: "stun:" + stun.LocalAddr().String()}
-	var settings webrtc.SettingEngine
+	settings := NewSettingEngine()
 	settings.SetIncludeLoopbackCandidate(true)
 	settings.SetSTUNGatherTimeout(time.Minute)
 	l, err := (ListenConfig{
