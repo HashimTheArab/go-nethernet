@@ -69,7 +69,7 @@ func TestDialICEConnectFailureReturnsSentinel(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = l.Close() })
 
-	var settings webrtc.SettingEngine
+	settings := NewSettingEngine()
 	settings.SetICETimeouts(100*time.Millisecond, 300*time.Millisecond, 50*time.Millisecond)
 	d := Dialer{
 		API:                     webrtc.NewAPI(webrtc.WithSettingEngine(settings)),
