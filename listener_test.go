@@ -1067,3 +1067,52 @@ type hostBundlesSignaling struct{ Signaling }
 
 // DisableHostTrickleICE ...
 func (hostBundlesSignaling) DisableHostTrickleICE() bool { return true }
+
+// An accepted connection passes every stage once; a client's error signal counts separately.
+func TestListenStatsCountEachStage(t *testing.T) {
+	client, server := newMemorySignalingPair("client", "server")
+	t.Cleanup(client.close)
+	t.Cleanup(server.close)
+	stats := &ListenStats{}
+	l, err := (ListenConfig{AllowAnonymous: true, Stats: stats}).Listen(server)
+	if err != nil {
+		t.Fatalf("Listen() error = %v", err)
+	}
+	t.Cleanup(func() { _ = l.Close() })
+	accepted := make(chan net.Conn, 1)
+	go func() {
+		if conn, err := l.Accept(); err == nil {
+			accepted <- conn
+		}
+	}()
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	clientConn, err := (Dialer{}).DialContext(ctx, server.NetworkID(), client)
+	if err != nil {
+		t.Fatalf("DialContext() error = %v", err)
+	}
+	t.Cleanup(func() { _ = clientConn.Close() })
+	var serverConn *Conn
+	select {
+	case conn := <-accepted:
+		serverConn = conn.(*Conn)
+		t.Cleanup(func() { _ = serverConn.Close() })
+	case <-ctx.Done():
+		t.Fatal("Accept() timed out")
+	}
+
+	addr := serverConn.RemoteAddr().(*Addr)
+	l.NotifySignal(&Signal{Type: SignalTypeError, ConnectionID: addr.ConnectionID, NetworkID: addr.NetworkID, Data: strconv.Itoa(ErrorCodeGenericFailure)})
+
+	read := func() [7]uint64 {
+		return [7]uint64{stats.Offers.Load(), stats.OffersRejected.Load(), stats.Answers.Load(), stats.ICEConnected.Load(),
+			stats.DTLSConnected.Load(), stats.Accepted.Load(), stats.RemoteErrors.Load()}
+	}
+	want := [7]uint64{1, 0, 1, 1, 1, 1, 1}
+	// Accepted is counted by the negotiation goroutine just after Accept receives the Conn.
+	for deadline := time.Now().Add(5 * time.Second); read() != want && time.Now().Before(deadline); time.Sleep(time.Millisecond) {
+	}
+	if got := read(); got != want {
+		t.Fatalf("[offers rejected answers ice dtls accepted remoteErrors] = %v, want %v", got, want)
+	}
+}
