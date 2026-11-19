@@ -88,6 +88,48 @@ func TestDialICEConnectFailureReturnsSentinel(t *testing.T) {
 	if errors.Is(err, ErrNoAnswer) {
 		t.Fatalf("DialContext() error = %v, want an ICE failure, not a missing answer", err)
 	}
+	// The listener's answer carried its host candidates, all rewritten to the silent IPv4 socket.
+	var iceErr *ICEConnectError
+	if !errors.As(err, &iceErr) {
+		t.Fatalf("DialContext() error = %v, want an *ICEConnectError", err)
+	}
+	if iceErr.Remote.HostIPv4 == 0 || iceErr.Remote.Relay != 0 {
+		t.Fatalf("ICEConnectError.Remote = %+v, want IPv4 host candidates only", iceErr.Remote)
+	}
+	// The agent drops its candidates when it fails; the dialer's own host candidates still count.
+	if iceErr.Local.HostIPv4+iceErr.Local.HostIPv6 == 0 {
+		t.Fatalf("ICEConnectError.Local = %+v, want the dialer's host candidates", iceErr.Local)
+	}
+	if strings.Contains(err.Error(), host) || strings.Contains(err.Error(), port) {
+		t.Fatalf("DialContext() error = %q, want no candidate address", err)
+	}
+}
+
+// A candidate summary counts each kind without its address and names only the kinds present.
+func TestCandidateSummary(t *testing.T) {
+	t.Parallel()
+	got := summarizeCandidates([]webrtc.ICECandidate{
+		{Typ: webrtc.ICECandidateTypeHost, Address: "192.0.2.1"},
+		{Typ: webrtc.ICECandidateTypeHost, Address: "192.0.2.2"},
+		{Typ: webrtc.ICECandidateTypeHost, Address: "2001:db8::1"},
+		{Typ: webrtc.ICECandidateTypeHost, Address: "0b9f6d4e-3f0a-4c6e-9b1a-1e2f3a4b5c6d.local"},
+		{Typ: webrtc.ICECandidateTypeSrflx, Address: "198.51.100.1"},
+		{Typ: webrtc.ICECandidateTypePrflx, Address: "198.51.100.2"},
+		{Typ: webrtc.ICECandidateTypeRelay, Address: "203.0.113.1"},
+	})
+	want := CandidateSummary{HostIPv4: 2, HostIPv6: 1, HostMDNS: 1, ServerReflexive: 1, PeerReflexive: 1, Relay: 1}
+	if got != want {
+		t.Fatalf("summarizeCandidates() = %+v, want %+v", got, want)
+	}
+	if s := got.String(); s != "host4=2 host6=1 mdns=1 srflx=1 prflx=1 relay=1" {
+		t.Fatalf("String() = %q", s)
+	}
+	if s := (CandidateSummary{ServerReflexive: 1}).String(); s != "srflx=1" {
+		t.Fatalf("String() = %q, want only the non-zero kind", s)
+	}
+	if s := (CandidateSummary{}).String(); s != "none" {
+		t.Fatalf("String() = %q, want none", s)
+	}
 }
 
 // A dial the server rejects with a terminal error signal is not mistaken for unreachability: it is
