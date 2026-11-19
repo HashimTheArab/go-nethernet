@@ -62,7 +62,9 @@ type Conn struct {
 	// candidates includes all [webrtc.ICECandidate] signaled from the remote connection.
 	// New candidates are appended atomically to the slice. It is guarded by candidatesMu.
 	candidates []webrtc.ICECandidate
-	// candidatesMu guards candidates from concurrent read-write access.
+	// localCandidates counts the local candidates gathered so far. It is guarded by candidatesMu.
+	localCandidates CandidateSummary
+	// candidatesMu guards candidates and localCandidates from concurrent read-write access.
 	candidatesMu sync.Mutex
 
 	// negotiator is either Listener or Dialer that the Conn has been negotiated through.
@@ -432,6 +434,110 @@ func (conn *Conn) Abort() error {
 // or a local close is not a reachability failure and does not carry it.
 var ErrICEConnectFailed = errors.New("nethernet: ICE transport failed to connect to the remote network")
 
+// ICEConnectError is the cause a Conn is closed with in place of [ErrICEConnectFailed], which it
+// matches with [errors.Is]. It adds the kinds of candidate each side offered, so a caller can tell
+// why no path worked without logging an address.
+type ICEConnectError struct {
+	// Local counts the candidates gathered for this Conn, and Remote those signaled by the remote
+	// connection, including any in its description. Peer-reflexive candidates found by checks are
+	// not counted.
+	Local, Remote CandidateSummary
+}
+
+// Error returns ErrICEConnectFailed's message followed by both candidate summaries.
+func (e *ICEConnectError) Error() string {
+	return fmt.Sprintf("%v (local candidates: %v; remote candidates: %v)", ErrICEConnectFailed, e.Local, e.Remote)
+}
+
+// Is reports whether target is ErrICEConnectFailed.
+func (e *ICEConnectError) Is(target error) bool {
+	return target == ErrICEConnectFailed
+}
+
+// CandidateSummary counts ICE candidates by type and address family. It holds no address, so it
+// is safe to log.
+type CandidateSummary struct {
+	// HostIPv4 and HostIPv6 count host candidates with an IP address, and HostMDNS those that hide
+	// it behind an mDNS (.local) name.
+	HostIPv4, HostIPv6, HostMDNS int
+	// ServerReflexive counts the public addresses a STUN server saw.
+	ServerReflexive int
+	// PeerReflexive counts candidates learned from connectivity checks.
+	PeerReflexive int
+	// Relay counts addresses allocated on a TURN server.
+	Relay int
+}
+
+// summarizeCandidates counts candidates by type and address family.
+func summarizeCandidates(candidates []webrtc.ICECandidate) CandidateSummary {
+	var s CandidateSummary
+	for _, c := range candidates {
+		s.add(c)
+	}
+	return s
+}
+
+// add counts one candidate.
+func (s *CandidateSummary) add(c webrtc.ICECandidate) {
+	switch c.Typ {
+	case webrtc.ICECandidateTypeHost:
+		switch {
+		case strings.HasSuffix(c.Address, ".local"):
+			s.HostMDNS++
+		case strings.Contains(c.Address, ":"):
+			s.HostIPv6++
+		default:
+			s.HostIPv4++
+		}
+	case webrtc.ICECandidateTypeSrflx:
+		s.ServerReflexive++
+	case webrtc.ICECandidateTypePrflx:
+		s.PeerReflexive++
+	case webrtc.ICECandidateTypeRelay:
+		s.Relay++
+	}
+}
+
+// String lists the non-zero counts, such as "host4=2 srflx=1", or "none".
+func (s CandidateSummary) String() string {
+	var b strings.Builder
+	for _, count := range []struct {
+		name string
+		n    int
+	}{
+		{"host4", s.HostIPv4}, {"host6", s.HostIPv6}, {"mdns", s.HostMDNS},
+		{"srflx", s.ServerReflexive}, {"prflx", s.PeerReflexive}, {"relay", s.Relay},
+	} {
+		if count.n == 0 {
+			continue
+		}
+		if b.Len() > 0 {
+			b.WriteByte(' ')
+		}
+		fmt.Fprintf(&b, "%v=%v", count.name, count.n)
+	}
+	if b.Len() == 0 {
+		return "none"
+	}
+	return b.String()
+}
+
+// iceConnectError returns the ICEConnectError for the candidates this Conn has gathered and
+// received so far. The ICE agent drops its candidates once it fails, so both sides come from the
+// Conn's own records.
+func (conn *Conn) iceConnectError() *ICEConnectError {
+	conn.candidatesMu.Lock()
+	defer conn.candidatesMu.Unlock()
+	return &ICEConnectError{Local: conn.localCandidates, Remote: summarizeCandidates(conn.candidates)}
+}
+
+// recordLocalCandidate counts a gathered local candidate for a later ICEConnectError.
+func (conn *Conn) recordLocalCandidate(candidate webrtc.ICECandidate) {
+	conn.candidatesMu.Lock()
+	conn.localCandidates.add(candidate)
+	conn.candidatesMu.Unlock()
+}
+
 const (
 	// readLoopEndTimeout bounds how long Receive waits after closure for Pion to deliver
 	// messages it already received.
@@ -521,14 +627,16 @@ func (conn *Conn) handleTransports() {
 			return
 		}
 		// A failed agent that never connected never reached the remote network, so a dial carries
-		// ErrICEConnectFailed and a caller may fall back. A close, or a failure after ICE connected,
-		// is not an initial reachability failure.
-		cause := fmt.Errorf("nethernet: ICE transport entered unrecoverable state: %s", state)
+		// an ICEConnectError, which is ErrICEConnectFailed, and a caller may fall back. A close, or
+		// a failure after ICE connected, is not an initial reachability failure.
 		if state == webrtc.ICETransportStateFailed && !conn.iceConnected.Load() {
-			cause = ErrICEConnectFailed
+			// This handler function itself is invoked while holding an internal lock, so read the
+			// candidates and close in a goroutine to avoid deadlock.
+			go func() { conn.close(conn.iceConnectError()) }()
+			return
 		}
 		// This handler function itself is invoked while holding an internal lock, so call close in a goroutine to avoid deadlock.
-		go conn.close(cause)
+		go conn.close(fmt.Errorf("nethernet: ICE transport entered unrecoverable state: %s", state))
 	})
 	conn.dtls.OnStateChange(func(state webrtc.DTLSTransportState) {
 		switch state {
@@ -803,6 +911,7 @@ func (conn *Conn) gatherCandidates(ctx context.Context) ([]webrtc.ICECandidate, 
 			close(complete)
 			return
 		}
+		conn.recordLocalCandidate(*candidate)
 		candidates = append(candidates, conn.signaledCandidate(*candidate))
 	})
 	if err := conn.gatherer.Gather(); err != nil {
@@ -855,6 +964,7 @@ func (conn *Conn) trickleCandidates(signaling Signaling) error {
 			}
 			return
 		}
+		conn.recordLocalCandidate(*candidate)
 		// Signal the local candidate in a goroutine so candidate gathering is never blocked by signaling.
 		// It uses [Conn.Context] as the parent context so signaling stops once the connection is closed.
 		go conn.trickleCandidate(signaling, formatICECandidate(int(candidateIndex.Add(1)-1), conn.signaledCandidate(*candidate), conn.description.ICE, true))
