@@ -134,8 +134,8 @@ type ListenConfig struct {
 	Stats *ListenStats
 }
 
-// ListenStats counts offers by the furthest stage they reach. Each counter only grows, so the drop
-// between two stages is the number of negotiations that stopped there.
+// ListenStats counts offers at each stage they pass. Each counter only grows. The gap between two
+// stages includes negotiations still in progress, and separate loads are not one snapshot.
 type ListenStats struct {
 	Offers         atomic.Uint64 // offers that started a negotiation
 	OffersRejected atomic.Uint64 // offers refused because every negotiation slot was taken
