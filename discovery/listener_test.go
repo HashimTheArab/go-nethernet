@@ -492,3 +492,43 @@ func TestExpiryLifetimesMatchVanilla(t *testing.T) {
 		t.Errorf("addressLifetime = %v, want %v", addressLifetime, time.Minute)
 	}
 }
+
+// Stats splits requests by source family and counts only what the Listener answered or was signaled.
+func TestStatsCountDiscoveryTraffic(t *testing.T) {
+	const localID uint64 = 1
+	stats := &Stats{}
+	l := &Listener{
+		conf:      ListenConfig{NetworkID: localID, Stats: stats},
+		addresses: make(map[uint64]address),
+		notifiers: make(map[uint32]nethernet.Notifier),
+		conn:      discardConn{},
+	}
+	v4 := &net.UDPAddr{IP: net.IPv4(192, 168, 1, 2), Port: 7551}
+	v6 := &net.UDPAddr{IP: net.ParseIP("fe80::2"), Port: 7551}
+	signal := (&nethernet.Signal{Type: nethernet.SignalTypeOffer, ConnectionID: 7, Data: "offer"}).String()
+
+	// Without pong data a request is counted but not answered.
+	if err := l.handlePacket(Marshal(&RequestPacket{}, 2), v4); err != nil {
+		t.Fatalf("handlePacket: %v", err)
+	}
+	l.pongData.Store(&[]byte{1})
+	for _, step := range []struct {
+		pk   Packet
+		addr net.Addr
+	}{
+		{&RequestPacket{}, v4},
+		{&RequestPacket{}, v6},
+		{&MessagePacket{RecipientID: localID, Data: "Ping"}, v4},
+		{&MessagePacket{RecipientID: localID + 1, Data: signal}, v4},
+		{&MessagePacket{RecipientID: localID, Data: signal}, v4},
+	} {
+		if err := l.handlePacket(Marshal(step.pk, 2), step.addr); err != nil {
+			t.Fatalf("handlePacket(%T): %v", step.pk, err)
+		}
+	}
+
+	got := [4]uint64{stats.RequestsIPv4.Load(), stats.RequestsIPv6.Load(), stats.Responses.Load(), stats.Signals.Load()}
+	if want := [4]uint64{2, 1, 2, 1}; got != want {
+		t.Fatalf("[ipv4 ipv6 responses signals] = %v, want %v", got, want)
+	}
+}
