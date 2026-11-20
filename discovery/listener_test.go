@@ -572,18 +572,19 @@ func TestStatsCountHostTraffic(t *testing.T) {
 	}
 }
 
-// An expired cache is read again, so the host's current addresses count as local.
+// An expired cache is read again; 192.0.2.1 (TEST-NET-1) is never assigned to a host.
 func TestFromHostReadsInterfaceAddresses(t *testing.T) {
-	i := slices.IndexFunc(localNetworks(), func(n localNetwork) bool { return !n.IP.IsLoopback() })
+	networks := localNetworks()
+	i := slices.IndexFunc(networks, func(n localNetwork) bool { return !n.IP.IsLoopback() })
 	if i < 0 {
 		t.Skip("no non-loopback interface address")
 	}
-	ip := localNetworks()[i].IP
-	l := &Listener{hostIPs: []net.IP{net.IPv4(10, 9, 9, 9)}}
+	ip := networks[i].IP
+	l := &Listener{hostIPs: []net.IP{net.IPv4(192, 0, 2, 1)}}
 	if !l.fromHost(&net.UDPAddr{IP: ip}) {
 		t.Fatalf("fromHost(%v) = false after the cache expired", ip)
 	}
-	if l.fromHost(&net.UDPAddr{IP: net.IPv4(10, 9, 9, 9)}) {
+	if l.fromHost(&net.UDPAddr{IP: net.IPv4(192, 0, 2, 1)}) {
 		t.Fatal("an address dropped from the host still counts as local")
 	}
 }
