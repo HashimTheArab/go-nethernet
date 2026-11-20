@@ -47,8 +47,8 @@ type ListenConfig struct {
 
 // Stats counts discovery traffic. Each counter only grows.
 type Stats struct {
-	RequestsIPv4 atomic.Uint64 // requests from IPv4 sources, including IPv4-mapped ones
-	RequestsIPv6 atomic.Uint64
+	RequestsIPv4  atomic.Uint64 // requests from IPv4 sources, including IPv4-mapped ones
+	RequestsIPv6  atomic.Uint64
 	RequestsLocal atomic.Uint64 // the requests above sent from this host, such as by a game on the same device
 	Responses     atomic.Uint64 // requests answered with this Listener's pong data
 	Signals       atomic.Uint64 // signals addressed to this Listener, excluding pings
