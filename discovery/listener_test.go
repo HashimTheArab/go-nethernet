@@ -87,7 +87,7 @@ func TestNotifyBroadcastsToMultipleSubscribers(t *testing.T) {
 		ConnectionID: 42,
 		Data:         "offer",
 	}
-	if err := l.handleMessage(&MessagePacket{RecipientID: localID, Data: signal.String()}, senderID); err != nil {
+	if err := l.handleMessage(&MessagePacket{RecipientID: localID, Data: signal.String()}, senderID, nil); err != nil {
 		t.Fatalf("handleMessage: %v", err)
 	}
 	assertSignalReceived(t, first, signal, senderID)
@@ -96,7 +96,7 @@ func TestNotifyBroadcastsToMultipleSubscribers(t *testing.T) {
 	stopFirst()
 
 	signal.ConnectionID = 43
-	if err := l.handleMessage(&MessagePacket{RecipientID: localID, Data: signal.String()}, senderID); err != nil {
+	if err := l.handleMessage(&MessagePacket{RecipientID: localID, Data: signal.String()}, senderID, nil); err != nil {
 		t.Fatalf("handleMessage after stop: %v", err)
 	}
 	assertNoSignalReceived(t, first)
@@ -530,5 +530,60 @@ func TestStatsCountDiscoveryTraffic(t *testing.T) {
 	got := [4]uint64{stats.RequestsIPv4.Load(), stats.RequestsIPv6.Load(), stats.Responses.Load(), stats.Signals.Load()}
 	if want := [4]uint64{2, 1, 2, 1}; got != want {
 		t.Fatalf("[ipv4 ipv6 responses signals] = %v, want %v", got, want)
+	}
+}
+
+// Requests and signals from loopback or the host's own addresses, in any form, count as local.
+func TestStatsCountHostTraffic(t *testing.T) {
+	const localID uint64 = 1
+	stats := &Stats{}
+	l := &Listener{
+		conf:      ListenConfig{NetworkID: localID, Stats: stats},
+		addresses: make(map[uint64]address),
+		notifiers: make(map[uint32]nethernet.Notifier),
+		conn:      discardConn{},
+		hostIPs:   []net.IP{net.IPv4(192, 168, 1, 5), net.ParseIP("fe80::5")},
+		hostIPsAt: time.Now(),
+	}
+	signal := (&nethernet.Signal{Type: nethernet.SignalTypeOffer, ConnectionID: 7, Data: "offer"}).String()
+	for _, tt := range []struct {
+		addr  *net.UDPAddr
+		local bool
+	}{
+		{&net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)}, true},
+		{&net.UDPAddr{IP: net.IPv6loopback}, true},
+		{&net.UDPAddr{IP: net.IPv4(192, 168, 1, 5)}, true},
+		{&net.UDPAddr{IP: net.ParseIP("::ffff:192.168.1.5")}, true},
+		{&net.UDPAddr{IP: net.ParseIP("fe80::5"), Zone: "3"}, true},
+		{&net.UDPAddr{IP: net.IPv4(192, 168, 1, 2)}, false},
+		{&net.UDPAddr{IP: net.ParseIP("fe80::2"), Zone: "3"}, false},
+	} {
+		requests, signals := stats.RequestsLocal.Load(), stats.SignalsLocal.Load()
+		if err := l.handlePacket(Marshal(&RequestPacket{}, 2), tt.addr); err != nil {
+			t.Fatalf("handlePacket request: %v", err)
+		}
+		if err := l.handlePacket(Marshal(&MessagePacket{RecipientID: localID, Data: signal}, 2), tt.addr); err != nil {
+			t.Fatalf("handlePacket signal: %v", err)
+		}
+		gotRequest, gotSignal := stats.RequestsLocal.Load() > requests, stats.SignalsLocal.Load() > signals
+		if gotRequest != tt.local || gotSignal != tt.local {
+			t.Errorf("%v: local request %t, local signal %t, want %t", tt.addr, gotRequest, gotSignal, tt.local)
+		}
+	}
+}
+
+// An expired cache is read again, so the host's current addresses count as local.
+func TestFromHostReadsInterfaceAddresses(t *testing.T) {
+	i := slices.IndexFunc(localNetworks(), func(n localNetwork) bool { return !n.IP.IsLoopback() })
+	if i < 0 {
+		t.Skip("no non-loopback interface address")
+	}
+	ip := localNetworks()[i].IP
+	l := &Listener{hostIPs: []net.IP{net.IPv4(10, 9, 9, 9)}}
+	if !l.fromHost(&net.UDPAddr{IP: ip}) {
+		t.Fatalf("fromHost(%v) = false after the cache expired", ip)
+	}
+	if l.fromHost(&net.UDPAddr{IP: net.IPv4(10, 9, 9, 9)}) {
+		t.Fatal("an address dropped from the host still counts as local")
 	}
 }
