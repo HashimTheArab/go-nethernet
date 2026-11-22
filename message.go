@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"io"
 	"sync"
-	"sync/atomic"
 
 	"github.com/pion/webrtc/v4"
 )
@@ -102,18 +101,13 @@ func wrapDataChannel(channel *webrtc.DataChannel, reliability MessageReliability
 			go conn.close(fmt.Errorf("nethernet: handle message in %s: %w", ch.Label(), err))
 		}
 	})
-	// Pion reports a failed read (anything but EOF) to OnError before it calls OnClose, so a channel
-	// closed by a transport failure is not mistaken for one the peer closed.
-	var readErr atomic.Pointer[error]
-	ch.OnError(func(err error) { readErr.Store(&err) })
 	ch.OnClose(func() {
 		ch.endRead()
-		cause := closeCause{text: fmt.Sprintf("nethernet: data channel %q closed by remote peer", ch.Label()), kind: ErrClosedByPeer}
-		if err := readErr.Load(); err != nil {
-			cause = closeCause{text: fmt.Sprintf("nethernet: data channel %q failed: %v", ch.Label(), *err), kind: ErrTransportFailed, err: *err}
-		}
+		// Pion also closes a channel after a failed read, and runs its error and close handlers on
+		// separate goroutines, so a channel closed by a transport failure can still report a peer
+		// close when this wins the race against the SCTP close cause.
 		// This handler function itself is invoked while holding an internal lock, so call close in a goroutine to avoid deadlock.
-		go conn.close(cause)
+		go conn.close(closeCause{text: fmt.Sprintf("nethernet: data channel %q closed by remote peer", ch.Label()), kind: ErrClosedByPeer})
 	})
 	return ch
 }
