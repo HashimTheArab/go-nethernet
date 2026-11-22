@@ -575,29 +575,21 @@ func startTURNServer(t *testing.T, allow bool) string {
 	return "turn:" + udp.LocalAddr().String() + "?transport=udp"
 }
 
-// TestCloseCauseKeepsItsTextAndMatchesItsKind covers the close causes callers classify: each keeps
-// the text logs have always shown and matches exactly one kind.
-func TestCloseCauseKeepsItsTextAndMatchesItsKind(t *testing.T) {
-	inner := errors.New("abort")
-	for _, test := range []struct {
-		cause     error
-		text      string
-		kind      error
-		otherKind error
-	}{
-		{closeCause{text: `nethernet: data channel "ReliableDataChannel" closed by remote peer`, kind: ErrClosedByPeer}, `nethernet: data channel "ReliableDataChannel" closed by remote peer`, ErrClosedByPeer, ErrTransportFailed},
-		{closeCause{text: "nethernet: SCTP transport closed", kind: ErrClosedByPeer}, "nethernet: SCTP transport closed", ErrClosedByPeer, ErrTransportFailed},
-		{closeCause{text: "nethernet: SCTP transport closed: abort", kind: ErrTransportFailed, err: inner}, "nethernet: SCTP transport closed: abort", ErrTransportFailed, ErrClosedByPeer},
-		{closeCause{text: "nethernet: ICE transport entered unrecoverable state: failed", kind: ErrTransportFailed}, "nethernet: ICE transport entered unrecoverable state: failed", ErrTransportFailed, ErrClosedByPeer},
-	} {
-		if test.cause.Error() != test.text {
-			t.Errorf("Error() = %q, want %q", test.cause.Error(), test.text)
-		}
-		if !errors.Is(test.cause, test.kind) || errors.Is(test.cause, test.otherKind) {
-			t.Errorf("%q: matches kind %v = %v, other kind %v = %v", test.text, test.kind, errors.Is(test.cause, test.kind), test.otherKind, errors.Is(test.cause, test.otherKind))
-		}
+// TestRemoteCloseIsAPeerClose covers what a caller sees when the remote peer closes: the cause
+// matches ErrClosedByPeer, not ErrTransportFailed.
+func TestRemoteCloseIsAPeerClose(t *testing.T) {
+	conn, serverConn := dialPair(t)
+	if err := serverConn.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
 	}
-	if !errors.Is(closeCause{kind: ErrTransportFailed, err: inner}, inner) {
-		t.Error("a close cause does not unwrap to its error")
+	ctx := conn.(*Conn).Context()
+	select {
+	case <-ctx.Done():
+	case <-time.After(10 * time.Second):
+		t.Fatal("remote closure was not observed")
+	}
+	cause := context.Cause(ctx)
+	if !errors.Is(cause, ErrClosedByPeer) || errors.Is(cause, ErrTransportFailed) {
+		t.Fatalf("close cause = %v, want ErrClosedByPeer", cause)
 	}
 }

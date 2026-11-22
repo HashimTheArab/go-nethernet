@@ -103,11 +103,10 @@ func wrapDataChannel(channel *webrtc.DataChannel, reliability MessageReliability
 	})
 	ch.OnClose(func() {
 		ch.endRead()
-		// Pion also closes a channel after a failed read, and runs its error and close handlers on
-		// separate goroutines, so a channel closed by a transport failure can still report a peer
-		// close when this wins the race against the SCTP close cause.
+		// A transport failure surfaces as ICE failing first, so a channel closing ends the connection
+		// the way the SCTP close does, whichever of Pion's callbacks runs first.
 		// This handler function itself is invoked while holding an internal lock, so call close in a goroutine to avoid deadlock.
-		go conn.close(closeCause{text: fmt.Sprintf("nethernet: data channel %q closed by remote peer", ch.Label()), kind: ErrClosedByPeer})
+		go conn.close(fmt.Errorf("%w: data channel %q closed", ErrClosedByPeer, ch.Label()))
 	})
 	return ch
 }
