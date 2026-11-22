@@ -531,12 +531,14 @@ func (conn *Conn) handleTransports() {
 		// A failed agent that never connected never reached the remote network, so a dial carries
 		// ErrICEConnectFailed and a caller may fall back. A close, or a failure after ICE connected,
 		// is not an initial reachability failure.
-		cause := fmt.Errorf("nethernet: ICE transport entered unrecoverable state: %s", state)
-		if state == webrtc.ICETransportStateFailed {
+		var cause error
+		switch {
+		case state == webrtc.ICETransportStateFailed && !conn.iceConnected.Load():
+			cause = ErrICEConnectFailed
+		case state == webrtc.ICETransportStateFailed:
 			cause = fmt.Errorf("%w: ICE transport entered unrecoverable state: %s", ErrTransportFailed, state)
-			if !conn.iceConnected.Load() {
-				cause = ErrICEConnectFailed
-			}
+		default:
+			cause = fmt.Errorf("nethernet: ICE transport entered unrecoverable state: %s", state)
 		}
 		// This handler function itself is invoked while holding an internal lock, so call close in a goroutine to avoid deadlock.
 		go conn.close(cause)
@@ -550,11 +552,11 @@ func (conn *Conn) handleTransports() {
 		}
 	})
 	conn.sctp.OnClose(func(err error) {
-		// Pion closes the association with no error however it ended; an error here means a data
-		// channel could not be opened. Neither is a transport failure, which ICE reports first.
+		// Pion closes the association with no error however it ended. An error means only that a
+		// new data channel failed to open, which neither side closed.
 		e := fmt.Errorf("%w: SCTP transport closed", ErrClosedByPeer)
 		if err != nil {
-			e = fmt.Errorf("%w: SCTP transport closed: %w", ErrClosedByPeer, err)
+			e = fmt.Errorf("nethernet: open data channel: %w", err)
 		}
 		// This handler function itself is invoked while holding an internal lock, so call close in a goroutine to avoid deadlock.
 		go conn.close(e)
