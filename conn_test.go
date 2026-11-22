@@ -574,3 +574,22 @@ func startTURNServer(t *testing.T, allow bool) string {
 	t.Cleanup(func() { _ = server.Close() })
 	return "turn:" + udp.LocalAddr().String() + "?transport=udp"
 }
+
+// TestRemoteCloseIsAPeerClose covers what a caller sees when the remote peer closes: the cause
+// matches ErrClosedByPeer, not ErrTransportFailed.
+func TestRemoteCloseIsAPeerClose(t *testing.T) {
+	conn, serverConn := dialPair(t)
+	if err := serverConn.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+	ctx := conn.(*Conn).Context()
+	select {
+	case <-ctx.Done():
+	case <-time.After(10 * time.Second):
+		t.Fatal("remote closure was not observed")
+	}
+	cause := context.Cause(ctx)
+	if !errors.Is(cause, ErrClosedByPeer) || errors.Is(cause, ErrTransportFailed) {
+		t.Fatalf("close cause = %v, want ErrClosedByPeer", cause)
+	}
+}

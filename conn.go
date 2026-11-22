@@ -432,6 +432,14 @@ func (conn *Conn) Abort() error {
 // or a local close is not a reachability failure and does not carry it.
 var ErrICEConnectFailed = errors.New("nethernet: ICE transport failed to connect to the remote network")
 
+// ErrClosedByPeer is matched by a Conn's close cause when the connection ended before ICE failed:
+// the remote peer closed a data channel or the SCTP association.
+var ErrClosedByPeer = errors.New("nethernet: closed by remote peer")
+
+// ErrTransportFailed is matched by a Conn's close cause when ICE failed after connecting, as when the
+// remote peer stops answering. SCTP retransmits without limit, so a silent peer always ends this way.
+var ErrTransportFailed = errors.New("nethernet: transport failed")
+
 const (
 	// readLoopEndTimeout bounds how long Receive waits after closure for Pion to deliver
 	// messages it already received.
@@ -523,9 +531,14 @@ func (conn *Conn) handleTransports() {
 		// A failed agent that never connected never reached the remote network, so a dial carries
 		// ErrICEConnectFailed and a caller may fall back. A close, or a failure after ICE connected,
 		// is not an initial reachability failure.
-		cause := fmt.Errorf("nethernet: ICE transport entered unrecoverable state: %s", state)
-		if state == webrtc.ICETransportStateFailed && !conn.iceConnected.Load() {
+		var cause error
+		switch {
+		case state == webrtc.ICETransportStateFailed && !conn.iceConnected.Load():
 			cause = ErrICEConnectFailed
+		case state == webrtc.ICETransportStateFailed:
+			cause = fmt.Errorf("%w: ICE transport entered unrecoverable state: %s", ErrTransportFailed, state)
+		default:
+			cause = fmt.Errorf("nethernet: ICE transport entered unrecoverable state: %s", state)
 		}
 		// This handler function itself is invoked while holding an internal lock, so call close in a goroutine to avoid deadlock.
 		go conn.close(cause)
@@ -539,11 +552,11 @@ func (conn *Conn) handleTransports() {
 		}
 	})
 	conn.sctp.OnClose(func(err error) {
-		var e error
+		// Pion closes the association with no error however it ended. An error means only that a
+		// new data channel failed to open, which neither side closed.
+		e := fmt.Errorf("%w: SCTP transport closed", ErrClosedByPeer)
 		if err != nil {
-			e = fmt.Errorf("nethernet: SCTP transport closed: %w", err)
-		} else {
-			e = errors.New("nethernet: SCTP transport closed")
+			e = fmt.Errorf("nethernet: open data channel: %w", err)
 		}
 		// This handler function itself is invoked while holding an internal lock, so call close in a goroutine to avoid deadlock.
 		go conn.close(e)
