@@ -574,3 +574,30 @@ func startTURNServer(t *testing.T, allow bool) string {
 	t.Cleanup(func() { _ = server.Close() })
 	return "turn:" + udp.LocalAddr().String() + "?transport=udp"
 }
+
+// TestCloseCauseKeepsItsTextAndMatchesItsKind covers the close causes callers classify: each keeps
+// the text logs have always shown and matches exactly one kind.
+func TestCloseCauseKeepsItsTextAndMatchesItsKind(t *testing.T) {
+	inner := errors.New("abort")
+	for _, test := range []struct {
+		cause     error
+		text      string
+		kind      error
+		otherKind error
+	}{
+		{closeCause{text: `nethernet: data channel "ReliableDataChannel" closed by remote peer`, kind: ErrClosedByPeer}, `nethernet: data channel "ReliableDataChannel" closed by remote peer`, ErrClosedByPeer, ErrTransportFailed},
+		{closeCause{text: "nethernet: SCTP transport closed", kind: ErrClosedByPeer}, "nethernet: SCTP transport closed", ErrClosedByPeer, ErrTransportFailed},
+		{closeCause{text: "nethernet: SCTP transport closed: abort", kind: ErrTransportFailed, err: inner}, "nethernet: SCTP transport closed: abort", ErrTransportFailed, ErrClosedByPeer},
+		{closeCause{text: "nethernet: ICE transport entered unrecoverable state: failed", kind: ErrTransportFailed}, "nethernet: ICE transport entered unrecoverable state: failed", ErrTransportFailed, ErrClosedByPeer},
+	} {
+		if test.cause.Error() != test.text {
+			t.Errorf("Error() = %q, want %q", test.cause.Error(), test.text)
+		}
+		if !errors.Is(test.cause, test.kind) || errors.Is(test.cause, test.otherKind) {
+			t.Errorf("%q: matches kind %v = %v, other kind %v = %v", test.text, test.kind, errors.Is(test.cause, test.kind), test.otherKind, errors.Is(test.cause, test.otherKind))
+		}
+	}
+	if !errors.Is(closeCause{kind: ErrTransportFailed, err: inner}, inner) {
+		t.Error("a close cause does not unwrap to its error")
+	}
+}

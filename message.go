@@ -104,7 +104,7 @@ func wrapDataChannel(channel *webrtc.DataChannel, reliability MessageReliability
 	ch.OnClose(func() {
 		ch.endRead()
 		// This handler function itself is invoked while holding an internal lock, so call close in a goroutine to avoid deadlock.
-		go conn.close(fmt.Errorf("nethernet: data channel %q closed by remote peer", ch.Label()))
+		go conn.close(closeCause{text: fmt.Sprintf("nethernet: data channel %q closed by remote peer", ch.Label()), kind: ErrClosedByPeer})
 	})
 	return ch
 }

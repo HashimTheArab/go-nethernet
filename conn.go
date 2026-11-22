@@ -432,6 +432,24 @@ func (conn *Conn) Abort() error {
 // or a local close is not a reachability failure and does not carry it.
 var ErrICEConnectFailed = errors.New("nethernet: ICE transport failed to connect to the remote network")
 
+// ErrClosedByPeer is matched by a Conn's close cause when the remote peer closed a data channel or
+// the SCTP association without an error.
+var ErrClosedByPeer = errors.New("nethernet: closed by remote peer")
+
+// ErrTransportFailed is matched by a Conn's close cause when its ICE, DTLS or SCTP transport failed
+// after connecting, as when the remote peer stops answering.
+var ErrTransportFailed = errors.New("nethernet: transport failed")
+
+// closeCause keeps a close cause's own text while matching kind, and unwraps to err.
+type closeCause struct {
+	text      string
+	kind, err error
+}
+
+func (c closeCause) Error() string        { return c.text }
+func (c closeCause) Is(target error) bool { return target == c.kind }
+func (c closeCause) Unwrap() error        { return c.err }
+
 const (
 	// readLoopEndTimeout bounds how long Receive waits after closure for Pion to deliver
 	// messages it already received.
@@ -523,7 +541,7 @@ func (conn *Conn) handleTransports() {
 		// A failed agent that never connected never reached the remote network, so a dial carries
 		// ErrICEConnectFailed and a caller may fall back. A close, or a failure after ICE connected,
 		// is not an initial reachability failure.
-		cause := fmt.Errorf("nethernet: ICE transport entered unrecoverable state: %s", state)
+		var cause error = closeCause{text: fmt.Sprintf("nethernet: ICE transport entered unrecoverable state: %s", state), kind: ErrTransportFailed}
 		if state == webrtc.ICETransportStateFailed && !conn.iceConnected.Load() {
 			cause = ErrICEConnectFailed
 		}
@@ -534,16 +552,14 @@ func (conn *Conn) handleTransports() {
 		switch state {
 		case webrtc.DTLSTransportStateClosed, webrtc.DTLSTransportStateFailed:
 			// This handler function itself is invoked while holding an internal lock, so call close in a goroutine to avoid deadlock.
-			go conn.close(fmt.Errorf("nethernet: DTLS transport entered unrecoverable state: %s", state))
+			go conn.close(closeCause{text: fmt.Sprintf("nethernet: DTLS transport entered unrecoverable state: %s", state), kind: ErrTransportFailed})
 		default:
 		}
 	})
 	conn.sctp.OnClose(func(err error) {
-		var e error
+		e := closeCause{text: "nethernet: SCTP transport closed", kind: ErrClosedByPeer}
 		if err != nil {
-			e = fmt.Errorf("nethernet: SCTP transport closed: %w", err)
-		} else {
-			e = errors.New("nethernet: SCTP transport closed")
+			e = closeCause{text: "nethernet: SCTP transport closed: " + err.Error(), kind: ErrTransportFailed, err: err}
 		}
 		// This handler function itself is invoked while holding an internal lock, so call close in a goroutine to avoid deadlock.
 		go conn.close(e)
