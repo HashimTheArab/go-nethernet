@@ -445,9 +445,10 @@ var ErrTransportFailed = errors.New("nethernet: transport failed")
 // ICEConnectError is the close cause that matches [ErrICEConnectFailed]. It counts the kinds of
 // candidate each side had, so a caller can tell why no path worked without logging an address.
 type ICEConnectError struct {
-	// Local counts every candidate gathered for this Conn, even one left out of a size-limited
-	// signal, as the ICE agent checks from all of them. Remote counts those the remote connection
-	// signaled, including any in its description.
+	// Local counts every candidate the gatherer reported for this Conn, even one left out of a
+	// size-limited signal, as the ICE agent checks from all of them. Pion checks from IPv6
+	// link-local addresses without reporting them, so those are missing. Remote counts those the
+	// remote connection signaled, including any in its description.
 	Local, Remote CandidateSummary
 }
 

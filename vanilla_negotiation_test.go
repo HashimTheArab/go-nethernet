@@ -124,6 +124,11 @@ func TestCandidateSummary(t *testing.T) {
 	if got != want {
 		t.Fatalf("summarizeCandidates() = %+v, want %+v", got, want)
 	}
+	for i := range reflect.TypeFor[CandidateSummary]().NumField() {
+		if reflect.ValueOf(got).Field(i).IsZero() {
+			t.Fatalf("summarizeCandidates() left %v zero, want a fixture candidate for every field", reflect.TypeFor[CandidateSummary]().Field(i).Name)
+		}
+	}
 	if s := got.String(); s != "host4=3 host6=1 mdns=2 srflx=1 relay=1" {
 		t.Fatalf("String() = %q", s)
 	}
