@@ -62,9 +62,9 @@ type Dialer struct {
 	// 'a=identity' attribute.
 	//
 	// When set to false, the server must present a valid identity assertion, except
-	// over signaling with a length limit such as LAN discovery, where hosts answer
-	// without one, as vanilla LAN hosts do: there only a Dialer with
-	// VerifyServerIdentity set requires it.
+	// over signaling with a length limit such as LAN discovery: there a Dialer without
+	// VerifyServerIdentity also accepts an answer that has none, as vanilla LAN hosts
+	// send. An assertion that is present is always verified.
 	// When set to true, unauthenticated servers are allowed to establish connections.
 	//
 	// This may be useful when connecting to legacy or custom implementations.
