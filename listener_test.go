@@ -913,12 +913,6 @@ func (s listenerResponseSignaling) Signal(ctx context.Context, signal *Signal) e
 // dialAcceptedListener establishes a real WebRTC connection and owns its cleanup.
 func dialAcceptedListener(t *testing.T, client, server Signaling) (*Listener, *Conn, *Conn) {
 	t.Helper()
-	return dialAcceptedListenerWith(t, Dialer{}, client, server)
-}
-
-// dialAcceptedListenerWith is dialAcceptedListener with the given Dialer.
-func dialAcceptedListenerWith(t *testing.T, dialer Dialer, client, server Signaling) (*Listener, *Conn, *Conn) {
-	t.Helper()
 	l, err := (ListenConfig{AllowAnonymous: true}).Listen(server)
 	if err != nil {
 		t.Fatalf("Listen() error = %v", err)
@@ -940,7 +934,7 @@ func dialAcceptedListenerWith(t *testing.T, dialer Dialer, client, server Signal
 			_ = conn.Close()
 		}
 	}()
-	clientConn, err := dialer.DialContext(ctx, server.NetworkID(), client)
+	clientConn, err := (Dialer{}).DialContext(ctx, server.NetworkID(), client)
 	if err != nil {
 		t.Fatalf("DialContext() error = %v", err)
 	}

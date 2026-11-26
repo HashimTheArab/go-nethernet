@@ -11,7 +11,7 @@ import (
 
 // fitAnswer encodes desc as the answer to offer. With a non-zero limit, it drops the bundled candidates
 // least likely to reach the client until the answer fits, keeping at least one. Those are the
-// candidates sharing the fewest leading address bits with any of remote.
+// candidates sharing the smallest leading share of their address with any of remote.
 func fitAnswer(desc *Description, remote []webrtc.ICECandidate, offer *Signal, limit int) (*Signal, error) {
 	if limit > 0 && len(desc.Candidates) > 1 {
 		desc.Candidates = rankCandidates(desc.Candidates, remote)
@@ -34,9 +34,9 @@ func fitAnswer(desc *Description, remote []webrtc.ICECandidate, offer *Signal, l
 	}
 }
 
-// rankCandidates returns local ordered by the most leading address bits each shares with a remote
-// candidate of the same family. Equal candidates keep their order, so with no comparable remote
-// address the order is unchanged.
+// rankCandidates returns local ordered by the largest leading share of its address each has in common
+// with a remote candidate of the same family, so a match on an IPv4 /24 outranks one on an IPv6 /48.
+// Equal candidates keep their order, so with no comparable remote address the order is unchanged.
 func rankCandidates(local, remote []webrtc.ICECandidate) []webrtc.ICECandidate {
 	type ranked struct {
 		candidate webrtc.ICECandidate
@@ -44,7 +44,7 @@ func rankCandidates(local, remote []webrtc.ICECandidate) []webrtc.ICECandidate {
 	}
 	r := make([]ranked, len(local))
 	for i, c := range local {
-		r[i] = ranked{candidate: c, shared: sharedPrefixBits(c.Address, remote)}
+		r[i] = ranked{candidate: c, shared: sharedPrefixShare(c.Address, remote)}
 	}
 	slices.SortStableFunc(r, func(a, b ranked) int {
 		return cmp.Compare(b.shared, a.shared)
@@ -56,9 +56,9 @@ func rankCandidates(local, remote []webrtc.ICECandidate) []webrtc.ICECandidate {
 	return out
 }
 
-// sharedPrefixBits returns the most leading bits address shares with a remote candidate's address of
-// the same family, or -1 if none is comparable.
-func sharedPrefixBits(address string, remote []webrtc.ICECandidate) int {
+// sharedPrefixShare returns the most leading bits address shares with a remote candidate's address of
+// the same family, scaled to a 128-bit address, or -1 if none is comparable.
+func sharedPrefixShare(address string, remote []webrtc.ICECandidate) int {
 	local, err := netip.ParseAddr(address)
 	if err != nil {
 		return -1
@@ -74,7 +74,7 @@ func sharedPrefixBits(address string, remote []webrtc.ICECandidate) int {
 		if addr.Is4() != local.Is4() {
 			continue
 		}
-		best = max(best, commonPrefixBits(local.AsSlice(), addr.AsSlice()))
+		best = max(best, commonPrefixBits(local.AsSlice(), addr.AsSlice())*128/local.BitLen())
 	}
 	return best
 }

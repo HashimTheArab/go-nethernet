@@ -288,7 +288,7 @@ func (d Dialer) DialContext(ctx context.Context, networkID string, signaling Sig
 						return nil, fmt.Errorf("verify server identity: %w", err)
 					}
 					c.publicKey = publicKey
-				} else if !d.AllowIdentitylessServer {
+				} else if !d.AllowIdentitylessServer && !answersAnonymously(d.Identity != nil, signaling) {
 					return nil, errors.New("identityless answer SDP not allowed")
 				}
 				for _, candidate := range desc.Candidates {

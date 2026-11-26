@@ -26,6 +26,7 @@ func TestFitAnswer(t *testing.T) {
 	xbox := []webrtc.ICECandidate{testHostCandidate("10.0.0.28")}
 	for _, tc := range []struct {
 		name   string
+		local  []string
 		remote []webrtc.ICECandidate
 		limit  int
 		first  string
@@ -35,9 +36,20 @@ func TestFitAnswer(t *testing.T) {
 		{name: "a limit keeps the client's network first", remote: xbox, limit: 1140, first: "10.0.0.221"},
 		{name: "a limit below one candidate keeps one", remote: xbox, limit: 1, first: "10.0.0.221", count: 1},
 		{name: "no comparable remote keeps the gathered order", limit: 1140, first: "100.103.203.98"},
+		{
+			name:   "an IPv4 subnet match outranks a wider IPv6 one",
+			local:  []string{"2001:db8:1:2::1", "2001:db8:1:3::1", "2001:db8:1:4::1", "2001:db8:1:5::1", "2001:db8:1:6::1", "10.0.0.221"},
+			remote: []webrtc.ICECandidate{testHostCandidate("10.0.0.28"), testHostCandidate("2001:db8:1:1::28")},
+			limit:  1140,
+			first:  "10.0.0.221",
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			desc := testAnswerDescription(laptopCandidates)
+			local := tc.local
+			if local == nil {
+				local = laptopCandidates
+			}
+			desc := testAnswerDescription(local)
 			answer, err := fitAnswer(desc, tc.remote, &Signal{Type: SignalTypeOffer, ConnectionID: 1, NetworkID: "2"}, tc.limit)
 			if err != nil {
 				t.Fatalf("fitAnswer() error = %v", err)
@@ -74,7 +86,7 @@ func TestListenerAnswerIdentity(t *testing.T) {
 			t.Cleanup(server.close)
 			recorded := &answerRecordingSignaling{memorySignaling: server, limit: tc.limit}
 
-			_, clientConn, serverConn := dialAcceptedListenerWith(t, Dialer{AllowIdentitylessServer: true}, client, recorded)
+			_, clientConn, serverConn := dialAcceptedListener(t, &answerRecordingSignaling{memorySignaling: client, limit: tc.limit}, recorded)
 			checkConnPayload(t, clientConn, serverConn, []byte("answered"))
 
 			answer := recorded.answer()

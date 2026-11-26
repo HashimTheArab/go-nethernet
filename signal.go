@@ -114,6 +114,12 @@ func maxSignalLength(signaling Signaling) int {
 	return 0
 }
 
+// answersAnonymously reports whether an offer is answered without an identity assertion: an anonymous
+// offer over Signaling with a length limit, which an assertion alone would exceed.
+func answersAnonymously(offerHasIdentity bool, signaling Signaling) bool {
+	return !offerHasIdentity && maxSignalLength(signaling) > 0
+}
+
 const (
 	// SignalTypeOffer is signaled by a client to request a connection to the remote host.
 	// Signals of SignalTypeOffer typically contain a data for a local description of the connection.
