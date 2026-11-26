@@ -145,6 +145,8 @@ func (d Dialer) DialContext(ctx context.Context, networkID string, signaling Sig
 	if d.Log == nil {
 		d.Log = slog.Default()
 	}
+	// Only a dialer that verifies no server may take the anonymous answer a LAN host sends.
+	acceptsAnonymousAnswer := d.AllowIdentitylessServer || (d.VerifyServerIdentity == nil && answersAnonymously(d.Identity != nil, signaling))
 	if d.VerifyServerIdentity == nil {
 		d.VerifyServerIdentity = func(ctx context.Context, identity *RemoteIdentity) (*ecdsa.PublicKey, error) {
 			publicKey, err := identity.PublicKey(true)
@@ -288,7 +290,7 @@ func (d Dialer) DialContext(ctx context.Context, networkID string, signaling Sig
 						return nil, fmt.Errorf("verify server identity: %w", err)
 					}
 					c.publicKey = publicKey
-				} else if !d.AllowIdentitylessServer && !answersAnonymously(d.Identity != nil, signaling) {
+				} else if !acceptsAnonymousAnswer {
 					return nil, errors.New("identityless answer SDP not allowed")
 				}
 				for _, candidate := range desc.Candidates {

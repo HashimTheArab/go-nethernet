@@ -2,9 +2,12 @@ package nethernet
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"errors"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/pion/sdp/v3"
 	"github.com/pion/webrtc/v4"
@@ -102,6 +105,32 @@ func TestListenerAnswerIdentity(t *testing.T) {
 				t.Fatalf("answer has identity = %v, want %v", got, tc.wantIdentity)
 			}
 		})
+	}
+}
+
+// A dialer that verifies its server rejects the anonymous answer a LAN host sends.
+func TestDialerWithServerVerifierRejectsAnonymousAnswer(t *testing.T) {
+	client, server := newMemorySignalingPair("client", "server")
+	t.Cleanup(client.close)
+	t.Cleanup(server.close)
+	l, err := (ListenConfig{AllowAnonymous: true}).Listen(&answerRecordingSignaling{memorySignaling: server, limit: 1140})
+	if err != nil {
+		t.Fatalf("Listen() error = %v", err)
+	}
+	t.Cleanup(func() { _ = l.Close() })
+
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	d := Dialer{VerifyServerIdentity: func(context.Context, *RemoteIdentity) (*ecdsa.PublicKey, error) {
+		return nil, errors.New("not the pinned server")
+	}}
+	conn, err := d.DialContext(ctx, server.NetworkID(), &answerRecordingSignaling{memorySignaling: client, limit: 1140})
+	if err == nil {
+		_ = conn.Close()
+		t.Fatal("DialContext() connected to a server it could not verify")
+	}
+	if !strings.Contains(err.Error(), "identityless answer SDP not allowed") {
+		t.Fatalf("DialContext() error = %v, want the identityless answer refused", err)
 	}
 }
 
