@@ -428,19 +428,26 @@ func (conn *Conn) Abort() error {
 	return conn.close(net.ErrClosed)
 }
 
-// ErrICEConnectFailed is the cause a Conn is closed with when its ICE transport gives up finding a
-// working path: the remote network was unreachable over WebRTC, so a dial returns it and a caller
+// ErrICEConnectFailed is matched by a Conn's close cause, an [ICEConnectError], when its ICE
+// transport gives up finding a working path: the remote network was unreachable over WebRTC, so a dial returns it and a caller
 // may fall back to another transport. A remote rejection, a transport failure after ICE connected,
 // or a local close is not a reachability failure and does not carry it.
 var ErrICEConnectFailed = errors.New("nethernet: ICE transport failed to connect to the remote network")
 
-// ICEConnectError is the cause a Conn is closed with in place of [ErrICEConnectFailed], which it
-// matches with [errors.Is]. It adds the kinds of candidate each side offered, so a caller can tell
-// why no path worked without logging an address.
+// ErrClosedByPeer is matched by a Conn's close cause when the connection ended before ICE failed:
+// the remote peer closed a data channel or the SCTP association.
+var ErrClosedByPeer = errors.New("nethernet: closed by remote peer")
+
+// ErrTransportFailed is matched by a Conn's close cause when ICE failed after connecting, as when the
+// remote peer stops answering. SCTP retransmits without limit, so a silent peer always ends this way.
+var ErrTransportFailed = errors.New("nethernet: transport failed")
+
+// ICEConnectError is the close cause that matches [ErrICEConnectFailed]. It counts the kinds of
+// candidate each side had, so a caller can tell why no path worked without logging an address.
 type ICEConnectError struct {
-	// Local counts the candidates gathered for this Conn, and Remote those signaled by the remote
-	// connection, including any in its description. Peer-reflexive candidates found by checks are
-	// not counted.
+	// Local counts every candidate gathered for this Conn, even one left out of a size-limited
+	// signal, as the ICE agent checks from all of them. Remote counts those the remote connection
+	// signaled, including any in its description.
 	Local, Remote CandidateSummary
 }
 
@@ -462,8 +469,6 @@ type CandidateSummary struct {
 	HostIPv4, HostIPv6, HostMDNS int
 	// ServerReflexive counts the public addresses a STUN server saw.
 	ServerReflexive int
-	// PeerReflexive counts candidates learned from connectivity checks.
-	PeerReflexive int
 	// Relay counts addresses allocated on a TURN server.
 	Relay int
 }
@@ -477,7 +482,8 @@ func summarizeCandidates(candidates []webrtc.ICECandidate) CandidateSummary {
 	return s
 }
 
-// add counts one candidate.
+// add counts one candidate. Peer-reflexive ones are skipped: they are learned from checks, never
+// gathered or signaled.
 func (s *CandidateSummary) add(c webrtc.ICECandidate) {
 	switch c.Typ {
 	case webrtc.ICECandidateTypeHost:
@@ -491,8 +497,6 @@ func (s *CandidateSummary) add(c webrtc.ICECandidate) {
 		}
 	case webrtc.ICECandidateTypeSrflx:
 		s.ServerReflexive++
-	case webrtc.ICECandidateTypePrflx:
-		s.PeerReflexive++
 	case webrtc.ICECandidateTypeRelay:
 		s.Relay++
 	}
@@ -506,7 +510,7 @@ func (s CandidateSummary) String() string {
 		n    int
 	}{
 		{"host4", s.HostIPv4}, {"host6", s.HostIPv6}, {"mdns", s.HostMDNS},
-		{"srflx", s.ServerReflexive}, {"prflx", s.PeerReflexive}, {"relay", s.Relay},
+		{"srflx", s.ServerReflexive}, {"relay", s.Relay},
 	} {
 		if count.n == 0 {
 			continue
@@ -627,16 +631,21 @@ func (conn *Conn) handleTransports() {
 			return
 		}
 		// A failed agent that never connected never reached the remote network, so a dial carries
-		// an ICEConnectError, which is ErrICEConnectFailed, and a caller may fall back. A close, or
-		// a failure after ICE connected, is not an initial reachability failure.
-		if state == webrtc.ICETransportStateFailed && !conn.iceConnected.Load() {
-			// This handler function itself is invoked while holding an internal lock, so read the
-			// candidates and close in a goroutine to avoid deadlock.
+		// an ICEConnectError, which matches ErrICEConnectFailed, and a caller may fall back. A close,
+		// or a failure after ICE connected, is not an initial reachability failure.
+		var cause error
+		switch {
+		case state == webrtc.ICETransportStateFailed && !conn.iceConnected.Load():
+			// Build the error in the goroutine too, as it takes candidatesMu.
 			go func() { conn.close(conn.iceConnectError()) }()
 			return
+		case state == webrtc.ICETransportStateFailed:
+			cause = fmt.Errorf("%w: ICE transport entered unrecoverable state: %s", ErrTransportFailed, state)
+		default:
+			cause = fmt.Errorf("nethernet: ICE transport entered unrecoverable state: %s", state)
 		}
 		// This handler function itself is invoked while holding an internal lock, so call close in a goroutine to avoid deadlock.
-		go conn.close(fmt.Errorf("nethernet: ICE transport entered unrecoverable state: %s", state))
+		go conn.close(cause)
 	})
 	conn.dtls.OnStateChange(func(state webrtc.DTLSTransportState) {
 		switch state {
@@ -647,11 +656,11 @@ func (conn *Conn) handleTransports() {
 		}
 	})
 	conn.sctp.OnClose(func(err error) {
-		var e error
+		// Pion closes the association with no error however it ended. An error means only that a
+		// new data channel failed to open, which neither side closed.
+		e := fmt.Errorf("%w: SCTP transport closed", ErrClosedByPeer)
 		if err != nil {
-			e = fmt.Errorf("nethernet: SCTP transport closed: %w", err)
-		} else {
-			e = errors.New("nethernet: SCTP transport closed")
+			e = fmt.Errorf("nethernet: open data channel: %w", err)
 		}
 		// This handler function itself is invoked while holding an internal lock, so call close in a goroutine to avoid deadlock.
 		go conn.close(e)

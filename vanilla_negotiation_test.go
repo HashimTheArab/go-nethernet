@@ -5,6 +5,7 @@ import (
 	"errors"
 	"log/slog"
 	"net"
+	"reflect"
 	"strconv"
 	"strings"
 	"testing"
@@ -117,11 +118,11 @@ func TestCandidateSummary(t *testing.T) {
 		{Typ: webrtc.ICECandidateTypePrflx, Address: "198.51.100.2"},
 		{Typ: webrtc.ICECandidateTypeRelay, Address: "203.0.113.1"},
 	})
-	want := CandidateSummary{HostIPv4: 2, HostIPv6: 1, HostMDNS: 1, ServerReflexive: 1, PeerReflexive: 1, Relay: 1}
+	want := CandidateSummary{HostIPv4: 2, HostIPv6: 1, HostMDNS: 1, ServerReflexive: 1, Relay: 1}
 	if got != want {
 		t.Fatalf("summarizeCandidates() = %+v, want %+v", got, want)
 	}
-	if s := got.String(); s != "host4=2 host6=1 mdns=1 srflx=1 prflx=1 relay=1" {
+	if s := got.String(); s != "host4=2 host6=1 mdns=1 srflx=1 relay=1" {
 		t.Fatalf("String() = %q", s)
 	}
 	if s := (CandidateSummary{ServerReflexive: 1}).String(); s != "srflx=1" {
@@ -129,6 +130,26 @@ func TestCandidateSummary(t *testing.T) {
 	}
 	if s := (CandidateSummary{}).String(); s != "none" {
 		t.Fatalf("String() = %q, want none", s)
+	}
+}
+
+// String names every CandidateSummary field, so a new kind cannot be left out of its hand-kept list.
+func TestCandidateSummaryStringNamesEveryField(t *testing.T) {
+	t.Parallel()
+	seen := make(map[string]string)
+	for i := range reflect.TypeFor[CandidateSummary]().NumField() {
+		var s CandidateSummary
+		reflect.ValueOf(&s).Elem().Field(i).SetInt(7)
+		name := reflect.TypeFor[CandidateSummary]().Field(i).Name
+		got := s.String()
+		kind, ok := strings.CutSuffix(got, "=7")
+		if !ok || strings.Contains(kind, " ") {
+			t.Fatalf("String() with only %v set = %q, want one kind=7", name, got)
+		}
+		if other, dup := seen[kind]; dup {
+			t.Fatalf("String() names %v and %v both %q", other, name, kind)
+		}
+		seen[kind] = name
 	}
 }
 

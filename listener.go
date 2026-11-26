@@ -129,6 +129,21 @@ type ListenConfig struct {
 	// This behavior can be seen on dedicated servers with the
 	// 'nethernet-disable-trickle-ice' setting property set to 'true'.
 	DisableTrickleICE bool
+
+	// Stats, if set, counts how far each incoming offer gets. It may be shared by several Listeners.
+	Stats *ListenStats
+}
+
+// ListenStats counts offers at each stage they pass. Each counter only grows. The gap between two
+// stages includes negotiations still in progress, and separate loads are not one snapshot.
+type ListenStats struct {
+	Offers         atomic.Uint64 // offers that started a negotiation
+	OffersRejected atomic.Uint64 // offers refused because every negotiation slot was taken
+	Answers        atomic.Uint64 // answers signaled back
+	ICEConnected   atomic.Uint64
+	DTLSConnected  atomic.Uint64
+	Accepted       atomic.Uint64 // connections with both data channels open, handed to Accept
+	RemoteErrors   atomic.Uint64 // error signals the client sent for a negotiation
 }
 
 // Listen listens on the local network ID specified by the Signaling implementation. It returns a Listener
@@ -284,6 +299,9 @@ func (n *listenerNegotiator) handleSignal(signal *Signal) bool {
 		// close the original peer. Reject it without sending a connection error.
 		return false
 	case SignalTypeError:
+		if s := n.conf.Stats; s != nil {
+			s.RemoteErrors.Add(1)
+		}
 		n.mu.Lock()
 		n.remoteCanceled.Store(true)
 		conn := n.conn
@@ -511,13 +529,15 @@ func (n *listenerNegotiator) handleOffer(signal *Signal) error {
 		)
 		return wrapSignalError(errors.New("nethernet: anonymous identity not allowed"), ErrorCodeIdentityNotAllowed)
 	}
-	identity, err := n.conf.IssueServerIdentity(ctx)
-	if err != nil {
-		return wrapSignalError(fmt.Errorf("issue server identity: %w", err), ErrorCodeFailedToCreateIdentityAssertion)
-	}
-	c.description.Identity, err = identity.Sign(c.description)
-	if err != nil {
-		return wrapSignalError(fmt.Errorf("generate identity assertion: %w", err), ErrorCodeFailedToCreateIdentityAssertion)
+	if !overLAN(n.signaling) {
+		identity, err := n.conf.IssueServerIdentity(ctx)
+		if err != nil {
+			return wrapSignalError(fmt.Errorf("issue server identity: %w", err), ErrorCodeFailedToCreateIdentityAssertion)
+		}
+		c.description.Identity, err = identity.Sign(c.description)
+		if err != nil {
+			return wrapSignalError(fmt.Errorf("generate identity assertion: %w", err), ErrorCodeFailedToCreateIdentityAssertion)
+		}
 	}
 
 	// Register a callback function immediately since the remote peer
@@ -546,20 +566,21 @@ func (n *listenerNegotiator) handleOffer(signal *Signal) error {
 		go c.close(fmt.Errorf("invalid data channel opened: %q", channel.Label()))
 	})
 
-	// Encode an answer using the local parameters!
-	answer, err := c.description.Encode()
-	if err != nil {
+	answer := &Signal{
+		Type:         SignalTypeAnswer,
+		ConnectionID: signal.ConnectionID,
+		NetworkID:    signal.NetworkID,
+	}
+	if err := fitSignal(n.conf.Log, c.description, desc.Candidates, answer, maxSignalLength(n.signaling)); err != nil {
 		return wrapSignalError(fmt.Errorf("encode answer: %w", err), ErrorCodeFailedToCreateAnswer)
 	}
 
-	if err := n.signaling.Signal(ctx, &Signal{
-		Type:         SignalTypeAnswer,
-		ConnectionID: signal.ConnectionID,
-		Data:         string(answer),
-		NetworkID:    signal.NetworkID,
-	}); err != nil {
+	if err := n.signaling.Signal(ctx, answer); err != nil {
 		// I don't think the error code will be signaled back to the remote connection, but just in case.
 		return wrapSignalError(fmt.Errorf("signal answer: %w", err), ErrorCodeSignalingFailedToSend)
+	}
+	if s := n.conf.Stats; s != nil {
+		s.Answers.Add(1)
 	}
 
 	if !disableTrickleICE {
@@ -690,6 +711,9 @@ func (n *listenerNegotiator) finaliseConn(conn *Conn, d *Description, channelsRe
 		return net.ErrClosed
 	case n.incoming <- conn:
 	}
+	if s := n.conf.Stats; s != nil {
+		s.Accepted.Add(1)
+	}
 	return nil
 }
 
@@ -703,10 +727,16 @@ func (n *listenerNegotiator) startTransports(ctx context.Context, conn *Conn, d 
 	if err := conn.ice.StartContext(ctx, nil, d.ICE, &iceRole); err != nil {
 		return fmt.Errorf("start ICE: %w", err)
 	}
+	if s := n.conf.Stats; s != nil {
+		s.ICEConnected.Add(1)
+	}
 
 	conn.log.Debug("starting DTLS transport", slog.String("remoteRole", d.DTLS.Role.String()))
 	if err := conn.dtls.StartContext(ctx, d.DTLS); err != nil {
 		return fmt.Errorf("start DTLS: %w", err)
+	}
+	if s := n.conf.Stats; s != nil {
+		s.DTLSConnected.Add(1)
 	}
 
 	conn.log.Debug("starting SCTP transport")
@@ -855,6 +885,9 @@ func (l *Listener) NotifySignal(signal *Signal) bool {
 				break
 			default:
 				l.conf.Log.Error("error allocating negotiation", "max", len(l.sem))
+				if s := l.conf.Stats; s != nil {
+					s.OffersRejected.Add(1)
+				}
 				l.negotiationsMu.Unlock()
 				return false
 			}
@@ -864,6 +897,9 @@ func (l *Listener) NotifySignal(signal *Signal) bool {
 				closed:   make(chan struct{}),
 			}
 			l.negotiations[key] = n
+			if s := l.conf.Stats; s != nil {
+				s.Offers.Add(1)
+			}
 			go n.negotiate(signal)
 			l.negotiationsMu.Unlock()
 			return true

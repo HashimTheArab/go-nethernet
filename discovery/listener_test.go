@@ -87,7 +87,7 @@ func TestNotifyBroadcastsToMultipleSubscribers(t *testing.T) {
 		ConnectionID: 42,
 		Data:         "offer",
 	}
-	if err := l.handleMessage(&MessagePacket{RecipientID: localID, Data: signal.String()}, senderID); err != nil {
+	if err := l.handleMessage(&MessagePacket{RecipientID: localID, Data: signal.String()}, senderID, nil); err != nil {
 		t.Fatalf("handleMessage: %v", err)
 	}
 	assertSignalReceived(t, first, signal, senderID)
@@ -96,7 +96,7 @@ func TestNotifyBroadcastsToMultipleSubscribers(t *testing.T) {
 	stopFirst()
 
 	signal.ConnectionID = 43
-	if err := l.handleMessage(&MessagePacket{RecipientID: localID, Data: signal.String()}, senderID); err != nil {
+	if err := l.handleMessage(&MessagePacket{RecipientID: localID, Data: signal.String()}, senderID, nil); err != nil {
 		t.Fatalf("handleMessage after stop: %v", err)
 	}
 	assertNoSignalReceived(t, first)
@@ -490,5 +490,101 @@ func TestExpiryLifetimesMatchVanilla(t *testing.T) {
 	}
 	if addressLifetime != time.Minute {
 		t.Errorf("addressLifetime = %v, want %v", addressLifetime, time.Minute)
+	}
+}
+
+// Stats splits requests by source family and counts only what the Listener answered or was signaled.
+func TestStatsCountDiscoveryTraffic(t *testing.T) {
+	const localID uint64 = 1
+	stats := &Stats{}
+	l := &Listener{
+		conf:      ListenConfig{NetworkID: localID, Stats: stats},
+		addresses: make(map[uint64]address),
+		notifiers: make(map[uint32]nethernet.Notifier),
+		conn:      discardConn{},
+	}
+	v4 := &net.UDPAddr{IP: net.IPv4(192, 168, 1, 2), Port: 7551}
+	v6 := &net.UDPAddr{IP: net.ParseIP("fe80::2"), Port: 7551}
+	signal := (&nethernet.Signal{Type: nethernet.SignalTypeOffer, ConnectionID: 7, Data: "offer"}).String()
+
+	// Without pong data a request is counted but not answered.
+	if err := l.handlePacket(Marshal(&RequestPacket{}, 2), v4); err != nil {
+		t.Fatalf("handlePacket: %v", err)
+	}
+	l.pongData.Store(&[]byte{1})
+	for _, step := range []struct {
+		pk   Packet
+		addr net.Addr
+	}{
+		{&RequestPacket{}, v4},
+		{&RequestPacket{}, v6},
+		{&MessagePacket{RecipientID: localID, Data: "Ping"}, v4},
+		{&MessagePacket{RecipientID: localID + 1, Data: signal}, v4},
+		{&MessagePacket{RecipientID: localID, Data: signal}, v4},
+	} {
+		if err := l.handlePacket(Marshal(step.pk, 2), step.addr); err != nil {
+			t.Fatalf("handlePacket(%T): %v", step.pk, err)
+		}
+	}
+
+	got := [4]uint64{stats.RequestsIPv4.Load(), stats.RequestsIPv6.Load(), stats.Responses.Load(), stats.Signals.Load()}
+	if want := [4]uint64{2, 1, 2, 1}; got != want {
+		t.Fatalf("[ipv4 ipv6 responses signals] = %v, want %v", got, want)
+	}
+}
+
+// Requests and signals from loopback or the host's own addresses, in any form, count as local.
+func TestStatsCountHostTraffic(t *testing.T) {
+	const localID uint64 = 1
+	stats := &Stats{}
+	l := &Listener{
+		conf:      ListenConfig{NetworkID: localID, Stats: stats},
+		addresses: make(map[uint64]address),
+		notifiers: make(map[uint32]nethernet.Notifier),
+		conn:      discardConn{},
+		hostIPs:   []net.IP{net.IPv4(192, 168, 1, 5), net.ParseIP("fe80::5")},
+		hostIPsAt: time.Now(),
+	}
+	signal := (&nethernet.Signal{Type: nethernet.SignalTypeOffer, ConnectionID: 7, Data: "offer"}).String()
+	for _, tt := range []struct {
+		addr  *net.UDPAddr
+		local bool
+	}{
+		{&net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)}, true},
+		{&net.UDPAddr{IP: net.IPv6loopback}, true},
+		{&net.UDPAddr{IP: net.IPv4(192, 168, 1, 5)}, true},
+		{&net.UDPAddr{IP: net.ParseIP("::ffff:192.168.1.5")}, true},
+		{&net.UDPAddr{IP: net.ParseIP("fe80::5"), Zone: "3"}, true},
+		{&net.UDPAddr{IP: net.IPv4(192, 168, 1, 2)}, false},
+		{&net.UDPAddr{IP: net.ParseIP("fe80::2"), Zone: "3"}, false},
+	} {
+		requests, signals := stats.RequestsLocal.Load(), stats.SignalsLocal.Load()
+		if err := l.handlePacket(Marshal(&RequestPacket{}, 2), tt.addr); err != nil {
+			t.Fatalf("handlePacket request: %v", err)
+		}
+		if err := l.handlePacket(Marshal(&MessagePacket{RecipientID: localID, Data: signal}, 2), tt.addr); err != nil {
+			t.Fatalf("handlePacket signal: %v", err)
+		}
+		gotRequest, gotSignal := stats.RequestsLocal.Load() > requests, stats.SignalsLocal.Load() > signals
+		if gotRequest != tt.local || gotSignal != tt.local {
+			t.Errorf("%v: local request %t, local signal %t, want %t", tt.addr, gotRequest, gotSignal, tt.local)
+		}
+	}
+}
+
+// An expired cache is read again; 192.0.2.1 (TEST-NET-1) is never assigned to a host.
+func TestFromHostReadsInterfaceAddresses(t *testing.T) {
+	networks := localNetworks()
+	i := slices.IndexFunc(networks, func(n localNetwork) bool { return !n.IP.IsLoopback() })
+	if i < 0 {
+		t.Skip("no non-loopback interface address")
+	}
+	ip := networks[i].IP
+	l := &Listener{hostIPs: []net.IP{net.IPv4(192, 0, 2, 1)}}
+	if !l.fromHost(&net.UDPAddr{IP: ip}) {
+		t.Fatalf("fromHost(%v) = false after the cache expired", ip)
+	}
+	if l.fromHost(&net.UDPAddr{IP: net.IPv4(192, 0, 2, 1)}) {
+		t.Fatal("an address dropped from the host still counts as local")
 	}
 }

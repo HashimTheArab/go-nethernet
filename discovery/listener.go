@@ -40,6 +40,19 @@ type ListenConfig struct {
 
 	// Log is used for logging messages at various levels.
 	Log *slog.Logger
+
+	// Stats, if set, counts the discovery traffic the Listener handles.
+	Stats *Stats
+}
+
+// Stats counts discovery traffic. Each counter only grows.
+type Stats struct {
+	RequestsIPv4  atomic.Uint64 // requests from IPv4 sources, including IPv4-mapped ones
+	RequestsIPv6  atomic.Uint64
+	RequestsLocal atomic.Uint64 // the requests above sent from this host, such as by a game on the same device
+	Responses     atomic.Uint64 // requests answered with this Listener's pong data
+	Signals       atomic.Uint64 // signals addressed to this Listener, excluding pings
+	SignalsLocal  atomic.Uint64 // the signals above sent from this host
 }
 
 // Listen starts listening on the specified address. An empty address binds port 7551 or else an ephemeral
@@ -173,6 +186,10 @@ type Listener struct {
 	responses   map[uint64]response
 	responsesMu sync.RWMutex
 
+	// hostIPs caches this host's addresses for Stats, as of hostIPsAt. Only the listen goroutine uses them.
+	hostIPs   []net.IP
+	hostIPsAt time.Time
+
 	// closed is a channel that is closed when the Listener closes.
 	closed chan struct{}
 	// once ensures the Listener is closed only once.
@@ -244,6 +261,18 @@ func (l *Listener) Credentials(context.Context) (*nethernet.Credentials, error) 
 // DisableHostTrickleICE reports that a host on LAN sends its candidates in the answer, as vanilla hosts do.
 func (l *Listener) DisableHostTrickleICE() bool {
 	return true
+}
+
+// LAN reports that signals travel over LAN discovery, where vanilla hosts answer without an identity assertion.
+func (l *Listener) LAN() bool {
+	return true
+}
+
+// MaxSignalLength returns the longest signal a message carries within the data length vanilla declares.
+// Such a message fits one datagram down to IPv6's 1280-byte minimum MTU; Xbox consoles lose an answer
+// split into IP fragments.
+func (l *Listener) MaxSignalLength() int {
+	return maxDeclaredMessageData
 }
 
 // NetworkID returns the numerical NetherNet network ID for the Listener in string form.
@@ -334,7 +363,7 @@ func (l *Listener) handlePacket(data []byte, addr net.Addr) error {
 	case *ResponsePacket:
 		err = l.handleResponse(pk, senderID)
 	case *MessagePacket:
-		err = l.handleMessage(pk, senderID)
+		err = l.handleMessage(pk, senderID, addr)
 	default:
 		err = fmt.Errorf("unknown packet: %T", pk)
 	}
@@ -345,6 +374,16 @@ func (l *Listener) handlePacket(data []byte, addr net.Addr) error {
 // handleRequest responds to a RequestPacket with a ResponsePacket containing the pongData. A Listener
 // without pongData hosts nothing and ignores it.
 func (l *Listener) handleRequest(addr net.Addr) error {
+	if s := l.conf.Stats; s != nil {
+		if udp, ok := addr.(*net.UDPAddr); ok && udp.IP.To4() == nil {
+			s.RequestsIPv6.Add(1)
+		} else {
+			s.RequestsIPv4.Add(1)
+		}
+		if l.fromHost(addr) {
+			s.RequestsLocal.Add(1)
+		}
+	}
 	data := l.pongData.Load()
 	if data == nil {
 		return nil
@@ -353,6 +392,9 @@ func (l *Listener) handleRequest(addr net.Addr) error {
 		ApplicationData: *data,
 	}, addr); err != nil {
 		return fmt.Errorf("write response: %w", err)
+	}
+	if s := l.conf.Stats; s != nil {
+		s.Responses.Add(1)
 	}
 	return nil
 }
@@ -368,7 +410,7 @@ func (l *Listener) handleResponse(pk *ResponsePacket, senderID uint64) error {
 
 // handleMessage handles a MessagePacket sent from the remote NetherNet network.
 // It discards the packet if the Data is "Ping" or empty, otherwise decodes them as a [nethernet.Signal].
-func (l *Listener) handleMessage(pk *MessagePacket, senderID uint64) error {
+func (l *Listener) handleMessage(pk *MessagePacket, senderID uint64, addr net.Addr) error {
 	if pk.RecipientID != l.conf.NetworkID {
 		return nil
 	}
@@ -381,6 +423,12 @@ func (l *Listener) handleMessage(pk *MessagePacket, senderID uint64) error {
 		return fmt.Errorf("decode signal: %w", err)
 	}
 	signal.NetworkID = strconv.FormatUint(senderID, 10)
+	if s := l.conf.Stats; s != nil {
+		s.Signals.Add(1)
+		if l.fromHost(addr) {
+			s.SignalsLocal.Add(1)
+		}
+	}
 
 	l.notifiersMu.RLock()
 	notifiers := make([]nethernet.Notifier, 0, len(l.notifiers))
@@ -520,6 +568,29 @@ func (l *Listener) deleteInactiveAddressesLocked(now time.Time) {
 		return now.Sub(a.t) >= addressLifetime
 	})
 }
+
+// fromHost reports whether addr is a loopback address or one of this host's interface addresses,
+// which it reads again once they are hostIPsLifetime old.
+func (l *Listener) fromHost(addr net.Addr) bool {
+	udp, ok := addr.(*net.UDPAddr)
+	if !ok {
+		return false
+	}
+	if udp.IP.IsLoopback() {
+		return true
+	}
+	if now := time.Now(); now.Sub(l.hostIPsAt) >= hostIPsLifetime {
+		l.hostIPs = l.hostIPs[:0]
+		for _, network := range localNetworks() {
+			l.hostIPs = append(l.hostIPs, network.IP)
+		}
+		l.hostIPsAt = now
+	}
+	return slices.ContainsFunc(l.hostIPs, udp.IP.Equal)
+}
+
+// hostIPsLifetime bounds how long a changed interface address, as after a Wi-Fi change, counts wrongly.
+const hostIPsLifetime = 10 * time.Second
 
 // localNetwork is an address of an up interface.
 type localNetwork struct {
