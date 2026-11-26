@@ -316,18 +316,19 @@ func TestListenerProcessesConnectionsIndependently(t *testing.T) {
 
 	// Keep the first connection blocked and fill only its queue. The second
 	// connection continues independently.
-	accepted := make(chan bool, maxPendingSignalsPerNegotiation)
-	for range maxPendingSignalsPerNegotiation {
+	fill := maxDeferredCandidateBytes / len(fillerCandidate)
+	accepted := make(chan bool, fill)
+	for range fill {
 		go func() {
 			accepted <- l.NotifySignal(&Signal{
 				Type:         SignalTypeCandidate,
 				ConnectionID: 1,
 				NetworkID:    "remote",
-				Data:         "candidate",
+				Data:         fillerCandidate,
 			})
 		}()
 	}
-	for i := range maxPendingSignalsPerNegotiation {
+	for i := range fill {
 		if !<-accepted {
 			t.Fatalf("NotifySignal(candidate #%d) = false, want true", i)
 		}
@@ -336,11 +337,18 @@ func TestListenerProcessesConnectionsIndependently(t *testing.T) {
 		Type:         SignalTypeCandidate,
 		ConnectionID: 1,
 		NetworkID:    "remote",
-		Data:         "candidate",
+		Data:         fillerCandidate,
 	}) {
 		t.Fatal("NotifySignal(over capacity) = true, want false")
 	}
+	// A malformed candidate is refused on arrival.
+	if l.NotifySignal(&Signal{Type: SignalTypeCandidate, ConnectionID: 2, NetworkID: "remote", Data: "candidate"}) {
+		t.Fatal("NotifySignal(malformed candidate) = true, want false")
+	}
 }
+
+// fillerCandidate is a valid candidate line for filling a deferred budget.
+const fillerCandidate = "candidate:1 1 udp 2130706431 192.0.2.1 5000 typ host"
 
 // waitForCredentialRequest waits for one offer to enter the blocked credential lookup.
 func waitForCredentialRequest(t *testing.T, started <-chan struct{}, name string) {
@@ -436,7 +444,7 @@ func TestListenerBoundsPendingNegotiations(t *testing.T) {
 		t.Fatal("offer above the pending negotiation limit was admitted")
 	}
 	// Pending connections can still receive signals when admission is full.
-	if !l.NotifySignal(&Signal{Type: SignalTypeCandidate, NetworkID: "remote", ConnectionID: 0, Data: "candidate"}) {
+	if !l.NotifySignal(&Signal{Type: SignalTypeCandidate, NetworkID: "remote", ConnectionID: 0, Data: fillerCandidate}) {
 		t.Fatal("pending negotiation could not receive a candidate at capacity")
 	}
 	(<-cancels)()
@@ -481,8 +489,8 @@ func TestListenerRemoteCancellationReleasesPendingOffers(t *testing.T) {
 	}
 	waitListenerState(t, l, maxListenerNegotiations, maxListenerNegotiations)
 	// Cancellation must work even when the candidate queue is already full.
-	for range maxPendingSignalsPerNegotiation {
-		if !l.NotifySignal(&Signal{Type: SignalTypeCandidate, NetworkID: "remote", ConnectionID: 0, Data: "candidate"}) {
+	for range maxDeferredCandidateBytes / len(fillerCandidate) {
+		if !l.NotifySignal(&Signal{Type: SignalTypeCandidate, NetworkID: "remote", ConnectionID: 0, Data: fillerCandidate}) {
 			t.Fatal("candidate rejected before deferred capacity")
 		}
 	}
@@ -760,7 +768,7 @@ func TestListenerIgnoresMalformedDeferredSignals(t *testing.T) {
 			gate := newBlockingCredentialsSignaling()
 			t.Cleanup(gate.close)
 			_, clientConn, serverConn := dialAcceptedListener(t,
-				earlyMalformedSignaling{Signaling: client, gate: gate, kind: kind},
+				earlySignaling{Signaling: client, gate: gate, kind: kind, data: []string{"invalid"}},
 				gatedOfferSignaling{Signaling: server, gate: gate},
 			)
 			checkConnPayload(t, clientConn, serverConn, []byte("handshake survived malformed signal"))
@@ -779,15 +787,16 @@ func (s gatedOfferSignaling) Credentials(ctx context.Context) (*Credentials, err
 	return s.gate.Credentials(ctx)
 }
 
-// earlyMalformedSignaling injects one malformed signal before the answer is built.
-type earlyMalformedSignaling struct {
+// earlySignaling injects signals of one kind before the answer is built.
+type earlySignaling struct {
 	Signaling
 	gate *blockingCredentialsSignaling
 	kind string
+	data []string
 }
 
-// Signal defers an invalid candidate or error while offer credentials are blocked.
-func (s earlyMalformedSignaling) Signal(ctx context.Context, signal *Signal) error {
+// Signal sends the early signals while offer credentials are blocked.
+func (s earlySignaling) Signal(ctx context.Context, signal *Signal) error {
 	if err := s.Signaling.Signal(ctx, signal); err != nil {
 		return err
 	}
@@ -799,9 +808,43 @@ func (s earlyMalformedSignaling) Signal(ctx context.Context, signal *Signal) err
 	case <-ctx.Done():
 		return ctx.Err()
 	}
-	err := s.Signaling.Signal(ctx, &Signal{Type: s.kind, NetworkID: signal.NetworkID, ConnectionID: signal.ConnectionID, Data: "invalid"})
-	close(s.gate.release)
-	return err
+	defer close(s.gate.release)
+	for _, data := range s.data {
+		if err := s.Signaling.Signal(ctx, &Signal{Type: s.kind, NetworkID: signal.NetworkID, ConnectionID: signal.ConnectionID, Data: data}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// A burst of candidates before the Conn is published all reach it, as vanilla queues them without limit.
+func TestListenerDefersEarlyCandidateBurst(t *testing.T) {
+	client, server := newMemorySignalingPair("client", "server")
+	t.Cleanup(client.close)
+	t.Cleanup(server.close)
+	gate := newBlockingCredentialsSignaling()
+	t.Cleanup(gate.close)
+	burst := make([]string, 100)
+	for i := range burst {
+		burst[i] = fmt.Sprintf("candidate:%d 1 udp 2130706431 192.0.2.%d 5000 typ host", i, i+1)
+	}
+	_, clientConn, serverConn := dialAcceptedListener(t,
+		earlySignaling{Signaling: client, gate: gate, kind: SignalTypeCandidate, data: burst},
+		gatedOfferSignaling{Signaling: server, gate: gate},
+	)
+	checkConnPayload(t, clientConn, serverConn, []byte("burst"))
+
+	serverConn.candidatesMu.Lock()
+	defer serverConn.candidatesMu.Unlock()
+	received := make(map[string]bool)
+	for _, c := range serverConn.candidates {
+		received[c.Address] = true
+	}
+	for i := range burst {
+		if address := fmt.Sprintf("192.0.2.%d", i+1); !received[address] {
+			t.Fatalf("early candidate %s was dropped", address)
+		}
+	}
 }
 
 func TestListenerRejectsDuplicateAfterAccept(t *testing.T) {
