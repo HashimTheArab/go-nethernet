@@ -15,6 +15,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unsafe"
 
 	"github.com/pion/sdp/v3"
 	"github.com/pion/webrtc/v4"
@@ -260,8 +261,12 @@ type negotiationKey struct {
 type listenerNegotiator struct {
 	key negotiationKey
 
-	deferred []*Signal
-	mu       sync.Mutex
+	// deferred holds candidates received before Conn publication, deferredBytes their
+	// deferredCandidateCost, and dropped whether one was refused over budget. All are guarded by mu.
+	deferred      []webrtc.ICECandidate
+	deferredBytes int
+	dropped       bool
+	mu            sync.Mutex
 
 	conn *Conn
 	// finished is guarded by mu and marks completion of the offer and any failure reply.
@@ -279,9 +284,15 @@ type listenerNegotiator struct {
 const (
 	// maxListenerNegotiations bounds offer goroutines through acceptance or failure delivery.
 	maxListenerNegotiations = 64
-	// maxPendingSignalsPerNegotiation bounds signals received before Conn publication.
-	maxPendingSignalsPerNegotiation = 32
+	// maxDeferredCandidateBytes bounds the memory one offer holds in candidates before its Conn is
+	// published. Vanilla queues without limit; this holds over 150 of the longest real candidate lines.
+	maxDeferredCandidateBytes = 64 << 10
 )
+
+// deferredCandidateCost is the memory a deferred candidate holds: its signal data and its parsed form.
+func deferredCandidateCost(data string) int {
+	return len(data) + int(unsafe.Sizeof(webrtc.ICECandidate{}))
+}
 
 // handleSignal handles the given Signal received from the remote network.
 // Candidates are deferred until the offer publishes its Conn.
@@ -316,6 +327,12 @@ func (n *listenerNegotiator) handleSignal(signal *Signal) bool {
 		}
 		return true
 	case SignalTypeCandidate:
+		// Parsing first gives every deferred candidate a minimum cost, so the byte budget also bounds their count.
+		candidate, err := parseRemoteCandidate(signal.Data)
+		if err != nil {
+			n.log().Error("error parsing candidate", "error", err)
+			return false
+		}
 		n.mu.Lock()
 		select {
 		case <-n.closed:
@@ -328,19 +345,25 @@ func (n *listenerNegotiator) handleSignal(signal *Signal) bool {
 			if conn.Context().Err() != nil {
 				return false
 			}
-			if err := conn.handleSignal(signal); err != nil {
+			if err := conn.addRemoteCandidate(candidate); err != nil {
 				conn.log.Error("error handling signal", "error", err)
 				return false
 			}
 			return true
 		}
 
-		if len(n.deferred) >= maxPendingSignalsPerNegotiation {
+		cost := deferredCandidateCost(signal.Data)
+		if n.deferredBytes+cost > maxDeferredCandidateBytes {
+			logDrop := !n.dropped
+			n.dropped = true
 			n.mu.Unlock()
-			n.log().Error("could not defer signal")
+			if logDrop {
+				n.log().Warn("dropping candidates over the deferred budget", "limit", maxDeferredCandidateBytes)
+			}
 			return false
 		}
-		n.deferred = append(n.deferred, signal)
+		n.deferred = append(n.deferred, candidate)
+		n.deferredBytes += cost
 		n.mu.Unlock()
 		return true
 	default:
@@ -418,7 +441,7 @@ func (n *listenerNegotiator) close() {
 	n.once.Do(func() {
 		close(n.closed)
 		n.mu.Lock()
-		n.deferred = nil
+		n.deferred, n.deferredBytes = nil, 0
 		finished := n.finished
 		n.mu.Unlock()
 		if finished {
@@ -603,11 +626,16 @@ func (n *listenerNegotiator) handleOffer(signal *Signal) error {
 	}
 	n.conn = c
 	deferred := n.deferred
-	n.deferred = nil
+	n.deferred, n.deferredBytes = nil, 0
 	n.mu.Unlock()
 
-	for _, deferredSignal := range deferred {
-		n.handleSignal(deferredSignal)
+	for _, candidate := range deferred {
+		if n.Context().Err() != nil || c.Context().Err() != nil {
+			break
+		}
+		if err := c.addRemoteCandidate(candidate); err != nil {
+			c.log.Error("error adding deferred candidate", "error", err)
+		}
 	}
 
 	if err := n.finaliseConn(c, desc, channelsReady); err != nil {
