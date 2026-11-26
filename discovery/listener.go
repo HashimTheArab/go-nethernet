@@ -263,6 +263,12 @@ func (l *Listener) DisableHostTrickleICE() bool {
 	return true
 }
 
+// MaxSignalLength returns the longest signal a message carries within the data length vanilla declares.
+// Such a message fits one datagram on any link; Xbox consoles lose an answer split into IP fragments.
+func (l *Listener) MaxSignalLength() int {
+	return maxDeclaredMessageData
+}
+
 // NetworkID returns the numerical NetherNet network ID for the Listener in string form.
 func (l *Listener) NetworkID() string {
 	return strconv.FormatUint(l.conf.NetworkID, 10)
