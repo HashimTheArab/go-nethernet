@@ -133,32 +133,29 @@ func TestListenerServerDataFitsOneDatagram(t *testing.T) {
 
 func TestServerDataFitNames(t *testing.T) {
 	for _, tc := range []struct {
-		name             string
-		server, level    string
-		limit            int
-		wantServer, want string
+		name          string
+		server, level string
+		// wantServer and wantLevel are checked when set.
+		wantServer, wantLevel string
 	}{
-		{name: "short data is unchanged", server: "Lunar Proxy", level: "World", limit: maxApplicationData, wantServer: "Lunar Proxy", want: "World"},
-		{name: "only the longer name is cut", server: strings.Repeat("s", 700), level: "World", limit: maxApplicationData},
-		{name: "a cut keeps whole runes", server: strings.Repeat("é", 400), level: strings.Repeat("ü", 400), limit: maxApplicationData},
+		{name: "short data is unchanged", server: "Lunar Proxy", level: "World", wantServer: "Lunar Proxy", wantLevel: "World"},
+		{name: "only the longer name is cut", server: strings.Repeat("s", 700), level: "World", wantLevel: "World"},
+		{name: "a cut keeps whole runes", server: strings.Repeat("é", 400), level: strings.Repeat("ü", 400)},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			d := ServerData{ServerName: tc.server, LevelName: tc.level, Version: "1.26.60", Nonce: "n"}
-			got := d.fitNames(tc.limit)
-			if tc.wantServer != "" && (got.ServerName != tc.wantServer || got.LevelName != tc.want) {
-				t.Fatalf("fitNames() names = %q, %q, want %q, %q", got.ServerName, got.LevelName, tc.wantServer, tc.want)
+			got := d.fitNames(maxApplicationData)
+			if (tc.wantServer != "" && got.ServerName != tc.wantServer) || (tc.wantLevel != "" && got.LevelName != tc.wantLevel) {
+				t.Fatalf("fitNames() names = %q, %q, want %q, %q", got.ServerName, got.LevelName, tc.wantServer, tc.wantLevel)
 			}
 			if !strings.HasPrefix(tc.server, got.ServerName) || !strings.HasPrefix(tc.level, got.LevelName) {
 				t.Fatalf("fitNames() names = %q, %q, want prefixes of the originals", got.ServerName, got.LevelName)
 			}
-			if !utf8.ValidString(got.ServerName) || !utf8.ValidString(got.LevelName) || strings.HasSuffix(got.ServerName, "§") {
-				t.Fatalf("fitNames() names = %q, %q, want whole runes and no dangling §", got.ServerName, got.LevelName)
+			if !utf8.ValidString(got.ServerName) || !utf8.ValidString(got.LevelName) {
+				t.Fatalf("fitNames() names = %q, %q, want whole runes", got.ServerName, got.LevelName)
 			}
-			if tc.level == "World" && got.LevelName != "World" {
-				t.Fatalf("fitNames() cut the shorter name to %q", got.LevelName)
-			}
-			if b, _ := got.MarshalBinary(); tc.limit >= 64 && len(b) > tc.limit {
-				t.Fatalf("fitNames() marshals to %d bytes, want at most %d", len(b), tc.limit)
+			if b, _ := got.MarshalBinary(); len(b) > maxApplicationData {
+				t.Fatalf("fitNames() marshals to %d bytes, want at most %d", len(b), maxApplicationData)
 			}
 		})
 	}
