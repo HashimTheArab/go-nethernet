@@ -1,10 +1,17 @@
 package discovery
 
 import (
+	"crypto/aes"
+	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
 	"io"
 )
+
+// maxApplicationData is the longest ApplicationData whose response fits maxDatagramSize: a SHA-256 HMAC,
+// then whole AES blocks holding at least one padding byte, the length, the 18-byte header, the data's
+// length prefix and the hex-encoded data.
+const maxApplicationData = ((maxDatagramSize-sha256.Size)/aes.BlockSize*aes.BlockSize - 1 - 2 - 18 - 4) / 2
 
 // ResponsePacket is a packet sent by servers in response to a RequestPacket from clients to advertise the world.
 type ResponsePacket struct {

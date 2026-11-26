@@ -3,6 +3,8 @@ package discovery
 import (
 	"bytes"
 	"fmt"
+	"strings"
+	"unicode/utf8"
 )
 
 // GameType represents the default game mode of a world.
@@ -84,6 +86,35 @@ func (d *ServerData) MarshalBinary() ([]byte, error) {
 	writeVarint32(buf, d.ConnectionType)
 
 	return buf.Bytes(), nil
+}
+
+// fitNames returns d with LevelName and ServerName cut, the longer first, so it marshals to at most limit
+// bytes. Other fields stay whole: the client checks Version and echoes Nonce. If the names alone cannot
+// make room, d is returned unchanged.
+func (d ServerData) fitNames(limit int) ServerData {
+	b, _ := d.MarshalBinary()
+	keep := len(d.LevelName) + len(d.ServerName) - (len(b) - limit)
+	if len(b) <= limit || keep < 0 {
+		return d
+	}
+	shorter := min(len(d.LevelName), len(d.ServerName))
+	n := keep / 2
+	if keep >= 2*shorter {
+		n = keep - shorter
+	}
+	d.LevelName, d.ServerName = cutName(d.LevelName, n), cutName(d.ServerName, n)
+	return d
+}
+
+// cutName returns s cut to at most n bytes on a rune boundary, without a trailing formatting code prefix.
+func cutName(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	for n > 0 && !utf8.RuneStart(s[n]) {
+		n--
+	}
+	return strings.TrimSuffix(s[:n], "§")
 }
 
 // UnmarshalBinary ...

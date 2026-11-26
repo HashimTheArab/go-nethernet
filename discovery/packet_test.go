@@ -211,9 +211,21 @@ func sealPayload(payload []byte) []byte {
 
 // A signal of the length a Listener allows fits one datagram on a link with IPv6's minimum MTU.
 func TestMaxSignalLengthFitsOneDatagram(t *testing.T) {
-	const minIPv6Payload = 1280 - 40 - 8
 	pk := &MessagePacket{RecipientID: 1<<64 - 1, Data: strings.Repeat("x", (&Listener{}).MaxSignalLength())}
-	if n := len(Marshal(pk, 1<<64-1)); n > minIPv6Payload {
-		t.Fatalf("message is %d bytes, want at most %d", n, minIPv6Payload)
+	if n := len(Marshal(pk, 1<<64-1)); n > maxDatagramSize {
+		t.Fatalf("message is %d bytes, want at most %d", n, maxDatagramSize)
+	}
+}
+
+// maxApplicationData is the largest response data that fits one datagram.
+func TestMaxApplicationDataFitsOneDatagram(t *testing.T) {
+	for _, tc := range []struct {
+		length int
+		fits   bool
+	}{{maxApplicationData, true}, {maxApplicationData + 1, false}} {
+		n := len(Marshal(&ResponsePacket{ApplicationData: make([]byte, tc.length)}, 1<<64-1))
+		if (n <= maxDatagramSize) != tc.fits {
+			t.Fatalf("response with %d bytes of data is %d bytes, want fits = %v within %d", tc.length, n, tc.fits, maxDatagramSize)
+		}
 	}
 }

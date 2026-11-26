@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"strings"
 	"testing"
+	"unicode/utf8"
 )
 
 func TestServerDataMarshalBinary(t *testing.T) {
@@ -95,5 +96,77 @@ func testServerData(serverName, levelName string) *ServerData {
 		AcceptsSelfSignedAuth: true,
 		ConnectionType:        4,
 		Nonce:                 "nonce",
+	}
+}
+
+// Long names are shortened so the response fits one datagram, keeping the fields the client relies on.
+func TestListenerServerDataFitsOneDatagram(t *testing.T) {
+	long := strings.Repeat("Long Server Name ", 40)
+	for name, set := range map[string]func(l *Listener){
+		"ServerData": func(l *Listener) {
+			l.ServerData(&ServerData{ServerName: long, LevelName: strings.Repeat("𝓦", 200), Version: "1.26.60", Nonce: "6e6f6e6365", ConnectionType: 4})
+		},
+		"PongData": func(l *Listener) {
+			l.PongData([]byte("MCPE;" + long + ";924;1.26.60;1;10;1234;" + long + ";Survival;1;19132;19133;0;"))
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			l := &Listener{}
+			set(l)
+			data := *l.pongData.Load()
+			if n := len(Marshal(&ResponsePacket{ApplicationData: data}, 1<<64-1)); n > maxDatagramSize {
+				t.Fatalf("response is %d bytes, want at most %d", n, maxDatagramSize)
+			}
+			var d ServerData
+			if err := d.UnmarshalBinary(data); err != nil {
+				t.Fatalf("UnmarshalBinary() error = %v", err)
+			}
+			if !utf8.ValidString(d.ServerName) || !utf8.ValidString(d.LevelName) || d.ServerName == "" || d.LevelName == "" {
+				t.Fatalf("names = %q, %q, want valid, non-empty prefixes", d.ServerName, d.LevelName)
+			}
+			if name == "ServerData" && (d.Version != "1.26.60" || d.Nonce != "6e6f6e6365") {
+				t.Fatalf("Version, Nonce = %q, %q, want them unchanged", d.Version, d.Nonce)
+			}
+		})
+	}
+}
+
+func TestServerDataFitNames(t *testing.T) {
+	for _, tc := range []struct {
+		name             string
+		server, level    string
+		limit            int
+		wantServer, want string
+	}{
+		{name: "short data is unchanged", server: "Lunar Proxy", level: "World", limit: maxApplicationData, wantServer: "Lunar Proxy", want: "World"},
+		{name: "only the longer name is cut", server: strings.Repeat("s", 700), level: "World", limit: maxApplicationData},
+		{name: "a cut keeps whole runes", server: strings.Repeat("é", 400), level: strings.Repeat("ü", 400), limit: maxApplicationData},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			d := ServerData{ServerName: tc.server, LevelName: tc.level, Version: "1.26.60", Nonce: "n"}
+			got := d.fitNames(tc.limit)
+			if tc.wantServer != "" && (got.ServerName != tc.wantServer || got.LevelName != tc.want) {
+				t.Fatalf("fitNames() names = %q, %q, want %q, %q", got.ServerName, got.LevelName, tc.wantServer, tc.want)
+			}
+			if !strings.HasPrefix(tc.server, got.ServerName) || !strings.HasPrefix(tc.level, got.LevelName) {
+				t.Fatalf("fitNames() names = %q, %q, want prefixes of the originals", got.ServerName, got.LevelName)
+			}
+			if !utf8.ValidString(got.ServerName) || !utf8.ValidString(got.LevelName) || strings.HasSuffix(got.ServerName, "§") {
+				t.Fatalf("fitNames() names = %q, %q, want whole runes and no dangling §", got.ServerName, got.LevelName)
+			}
+			if tc.level == "World" && got.LevelName != "World" {
+				t.Fatalf("fitNames() cut the shorter name to %q", got.LevelName)
+			}
+			if b, _ := got.MarshalBinary(); tc.limit >= 64 && len(b) > tc.limit {
+				t.Fatalf("fitNames() marshals to %d bytes, want at most %d", len(b), tc.limit)
+			}
+		})
+	}
+}
+
+// A cut never leaves a formatting prefix without its code.
+func TestCutNameDropsDanglingFormattingPrefix(t *testing.T) {
+	if got := cutName("ab§c", 4); got != "ab" {
+		t.Fatalf("cutName() = %q, want %q", got, "ab")
 	}
 }
