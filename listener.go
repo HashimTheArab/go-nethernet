@@ -573,6 +573,14 @@ func (n *listenerNegotiator) handleOffer(signal *Signal) error {
 	if err != nil {
 		return wrapSignalError(fmt.Errorf("encode answer: %w", err), ErrorCodeFailedToCreateAnswer)
 	}
+	if length := len(answer.String()); limit > 0 && length > limit {
+		n.conf.Log.Warn("answer exceeds the signaling length limit and may not arrive",
+			slog.Uint64("connectionID", signal.ConnectionID),
+			slog.String("networkID", signal.NetworkID),
+			slog.Int("length", length),
+			slog.Int("limit", limit),
+		)
+	}
 
 	if err := n.signaling.Signal(ctx, answer); err != nil {
 		// I don't think the error code will be signaled back to the remote connection, but just in case.

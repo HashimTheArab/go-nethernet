@@ -264,7 +264,8 @@ func (l *Listener) DisableHostTrickleICE() bool {
 }
 
 // MaxSignalLength returns the longest signal a message carries within the data length vanilla declares.
-// Such a message fits one datagram on any link; Xbox consoles lose an answer split into IP fragments.
+// Such a message fits one datagram down to IPv6's 1280-byte minimum MTU; Xbox consoles lose an answer
+// split into IP fragments.
 func (l *Listener) MaxSignalLength() int {
 	return maxDeclaredMessageData
 }
