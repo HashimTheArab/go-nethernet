@@ -623,6 +623,9 @@ func (n *listenerNegotiator) handleOffer(signal *Signal) error {
 	n.mu.Unlock()
 
 	for _, candidate := range deferred {
+		if n.Context().Err() != nil || c.Context().Err() != nil {
+			break
+		}
 		if err := c.addRemoteCandidate(candidate); err != nil {
 			c.log.Error("error adding deferred candidate", "error", err)
 		}
