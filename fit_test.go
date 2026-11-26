@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/ecdsa"
 	"errors"
+	"log/slog"
 	"strings"
 	"sync"
 	"testing"
@@ -25,7 +26,7 @@ var laptopCandidates = []string{
 	"2606:4700:cf1:1000::7",
 }
 
-func TestFitAnswer(t *testing.T) {
+func TestFitSignal(t *testing.T) {
 	xbox := []webrtc.ICECandidate{testHostCandidate("10.0.0.28")}
 	for _, tc := range []struct {
 		name   string
@@ -46,6 +47,14 @@ func TestFitAnswer(t *testing.T) {
 			limit:  1140,
 			first:  "10.0.0.221",
 		},
+		{
+			name:   "an IPv6 subnet match outranks an IPv4 one on another subnet",
+			local:  []string{"10.0.5.1", "2001:db8:1:1:8000::5"},
+			remote: []webrtc.ICECandidate{testHostCandidate("10.0.0.28"), testHostCandidate("2001:db8:1:1::28")},
+			limit:  1,
+			first:  "2001:db8:1:1:8000::5",
+			count:  1,
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			local := tc.local
@@ -53,12 +62,9 @@ func TestFitAnswer(t *testing.T) {
 				local = laptopCandidates
 			}
 			desc := testAnswerDescription(local)
-			answer, err := fitAnswer(desc, tc.remote, &Signal{Type: SignalTypeOffer, ConnectionID: 1, NetworkID: "2"}, tc.limit)
-			if err != nil {
-				t.Fatalf("fitAnswer() error = %v", err)
-			}
-			if answer.Type != SignalTypeAnswer || answer.ConnectionID != 1 || answer.NetworkID != "2" {
-				t.Fatalf("fitAnswer() = %+v, want an answer to the offer", answer)
+			answer := &Signal{Type: SignalTypeAnswer, ConnectionID: 1, NetworkID: "2"}
+			if err := fitSignal(slog.New(slog.DiscardHandler), desc, tc.remote, answer, tc.limit); err != nil {
+				t.Fatalf("fitSignal() error = %v", err)
 			}
 			got := answerCandidates(t, answer.Data)
 			if got[0] != tc.first {
@@ -74,41 +80,45 @@ func TestFitAnswer(t *testing.T) {
 	}
 }
 
-func TestListenerAnswerIdentity(t *testing.T) {
+// Over LAN discovery neither the offer nor the answer is signed, whatever the dialer's identity; elsewhere
+// both are, even over signaling with a length limit.
+func TestLANSignalIdentity(t *testing.T) {
 	for _, tc := range []struct {
 		name         string
+		lan          bool
 		limit        int
-		signedOffer  bool
 		wantIdentity bool
 	}{
-		{name: "unlimited signaling", limit: 0, wantIdentity: true},
-		{name: "length-limited signaling", limit: 1140, wantIdentity: false},
-		{name: "a signed offer over length-limited signaling", limit: 1140, signedOffer: true, wantIdentity: false},
+		{name: "other signaling", wantIdentity: true},
+		{name: "a length limit without LAN", limit: 1140, wantIdentity: true},
+		{name: "LAN", lan: true, limit: 1140, wantIdentity: false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			client, server := newMemorySignalingPair("client", "server")
 			t.Cleanup(client.close)
 			t.Cleanup(server.close)
-			recorded := &answerRecordingSignaling{memorySignaling: server, limit: tc.limit}
+			clientSignaling := &sentSignaling{memorySignaling: client, lan: tc.lan, limit: tc.limit}
+			serverSignaling := &sentSignaling{memorySignaling: server, lan: tc.lan, limit: tc.limit}
 
-			var dialer Dialer
-			if tc.signedOffer {
-				dialer.Identity = newTestClientIdentity(t)
-			}
-			_, clientConn, serverConn := dialAcceptedListenerWith(t, dialer, &answerRecordingSignaling{memorySignaling: client, limit: tc.limit}, recorded)
+			dialer := Dialer{Identity: newTestClientIdentity(t)}
+			_, clientConn, serverConn := dialAcceptedListenerWith(t, dialer, clientSignaling, serverSignaling)
 			checkConnPayload(t, clientConn, serverConn, []byte("answered"))
 
-			answer := recorded.answer()
-			d := &sdp.SessionDescription{}
-			if err := d.UnmarshalString(answer); err != nil {
-				t.Fatalf("decode answer: %v", err)
-			}
-			desc, err := ParseDescription(d)
-			if err != nil {
-				t.Fatalf("parse answer: %v", err)
-			}
-			if got := desc.Identity != nil; got != tc.wantIdentity {
-				t.Fatalf("answer has identity = %v, want %v", got, tc.wantIdentity)
+			for _, sent := range []struct {
+				name string
+				data string
+			}{{"offer", clientSignaling.sent(SignalTypeOffer)}, {"answer", serverSignaling.sent(SignalTypeAnswer)}} {
+				d := &sdp.SessionDescription{}
+				if err := d.UnmarshalString(sent.data); err != nil {
+					t.Fatalf("decode %s: %v", sent.name, err)
+				}
+				desc, err := ParseDescription(d)
+				if err != nil {
+					t.Fatalf("parse %s: %v", sent.name, err)
+				}
+				if got := desc.Identity != nil; got != tc.wantIdentity {
+					t.Fatalf("%s has identity = %v, want %v", sent.name, got, tc.wantIdentity)
+				}
 			}
 		})
 	}
@@ -119,7 +129,7 @@ func TestDialerWithServerVerifierRejectsAnonymousAnswer(t *testing.T) {
 	client, server := newMemorySignalingPair("client", "server")
 	t.Cleanup(client.close)
 	t.Cleanup(server.close)
-	l, err := (ListenConfig{AllowAnonymous: true}).Listen(&answerRecordingSignaling{memorySignaling: server, limit: 1140})
+	l, err := (ListenConfig{AllowAnonymous: true}).Listen(&sentSignaling{memorySignaling: server, lan: true})
 	if err != nil {
 		t.Fatalf("Listen() error = %v", err)
 	}
@@ -130,7 +140,7 @@ func TestDialerWithServerVerifierRejectsAnonymousAnswer(t *testing.T) {
 	d := Dialer{VerifyServerIdentity: func(context.Context, *RemoteIdentity) (*ecdsa.PublicKey, error) {
 		return nil, errors.New("not the pinned server")
 	}}
-	conn, err := d.DialContext(ctx, server.NetworkID(), &answerRecordingSignaling{memorySignaling: client, limit: 1140})
+	conn, err := d.DialContext(ctx, server.NetworkID(), &sentSignaling{memorySignaling: client, lan: true})
 	if err == nil {
 		_ = conn.Close()
 		t.Fatal("DialContext() connected to a server it could not verify")
@@ -140,30 +150,34 @@ func TestDialerWithServerVerifierRejectsAnonymousAnswer(t *testing.T) {
 	}
 }
 
-// answerRecordingSignaling records the answer it sends and limits signal length when limit is set.
-type answerRecordingSignaling struct {
+// sentSignaling records the last signal of each type it sends, and reports LAN and a length limit as set.
+type sentSignaling struct {
 	*memorySignaling
+	lan   bool
 	limit int
 
 	mu   sync.Mutex
-	data string
+	data map[string]string
 }
 
-func (s *answerRecordingSignaling) Signal(ctx context.Context, signal *Signal) error {
-	if signal.Type == SignalTypeAnswer {
-		s.mu.Lock()
-		s.data = signal.Data
-		s.mu.Unlock()
+func (s *sentSignaling) Signal(ctx context.Context, signal *Signal) error {
+	s.mu.Lock()
+	if s.data == nil {
+		s.data = make(map[string]string)
 	}
+	s.data[signal.Type] = signal.Data
+	s.mu.Unlock()
 	return s.memorySignaling.Signal(ctx, signal)
 }
 
-func (s *answerRecordingSignaling) MaxSignalLength() int { return s.limit }
+func (s *sentSignaling) LAN() bool { return s.lan }
 
-func (s *answerRecordingSignaling) answer() string {
+func (s *sentSignaling) MaxSignalLength() int { return s.limit }
+
+func (s *sentSignaling) sent(typ string) string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.data
+	return s.data[typ]
 }
 
 func newTestClientIdentity(t *testing.T) *Identity {

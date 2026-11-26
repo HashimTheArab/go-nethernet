@@ -114,11 +114,17 @@ func maxSignalLength(signaling Signaling) int {
 	return 0
 }
 
-// answersAnonymously reports whether a host answers without an identity assertion over the Signaling:
-// one with a length limit, such as LAN discovery, where vanilla hosts never sign their answers and an
-// assertion alone would exceed the limit.
-func answersAnonymously(signaling Signaling) bool {
-	return maxSignalLength(signaling) > 0
+// lanSignaling is implemented by Signaling over LAN discovery, where vanilla hosts answer without an
+// identity assertion and an assertion alone would overflow one datagram.
+type lanSignaling interface {
+	// LAN reports whether signals travel over LAN discovery.
+	LAN() bool
+}
+
+// overLAN reports whether the Signaling carries signals over LAN discovery.
+func overLAN(signaling Signaling) bool {
+	l, ok := signaling.(lanSignaling)
+	return ok && l.LAN()
 }
 
 const (

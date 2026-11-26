@@ -263,6 +263,11 @@ func (l *Listener) DisableHostTrickleICE() bool {
 	return true
 }
 
+// LAN reports that signals travel over LAN discovery, where vanilla hosts answer without an identity assertion.
+func (l *Listener) LAN() bool {
+	return true
+}
+
 // MaxSignalLength returns the longest signal a message carries within the data length vanilla declares.
 // Such a message fits one datagram down to IPv6's 1280-byte minimum MTU; Xbox consoles lose an answer
 // split into IP fragments.

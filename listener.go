@@ -529,8 +529,7 @@ func (n *listenerNegotiator) handleOffer(signal *Signal) error {
 		)
 		return wrapSignalError(errors.New("nethernet: anonymous identity not allowed"), ErrorCodeIdentityNotAllowed)
 	}
-	limit := maxSignalLength(n.signaling)
-	if !answersAnonymously(n.signaling) {
+	if !overLAN(n.signaling) {
 		identity, err := n.conf.IssueServerIdentity(ctx)
 		if err != nil {
 			return wrapSignalError(fmt.Errorf("issue server identity: %w", err), ErrorCodeFailedToCreateIdentityAssertion)
@@ -567,17 +566,13 @@ func (n *listenerNegotiator) handleOffer(signal *Signal) error {
 		go c.close(fmt.Errorf("invalid data channel opened: %q", channel.Label()))
 	})
 
-	answer, err := fitAnswer(c.description, desc.Candidates, signal, limit)
-	if err != nil {
-		return wrapSignalError(fmt.Errorf("encode answer: %w", err), ErrorCodeFailedToCreateAnswer)
+	answer := &Signal{
+		Type:         SignalTypeAnswer,
+		ConnectionID: signal.ConnectionID,
+		NetworkID:    signal.NetworkID,
 	}
-	if length := len(answer.String()); limit > 0 && length > limit {
-		n.conf.Log.Warn("answer exceeds the signaling length limit and may not arrive",
-			slog.Uint64("connectionID", signal.ConnectionID),
-			slog.String("networkID", signal.NetworkID),
-			slog.Int("length", length),
-			slog.Int("limit", limit),
-		)
+	if err := fitSignal(n.conf.Log, c.description, desc.Candidates, answer, maxSignalLength(n.signaling)); err != nil {
+		return wrapSignalError(fmt.Errorf("encode answer: %w", err), ErrorCodeFailedToCreateAnswer)
 	}
 
 	if err := n.signaling.Signal(ctx, answer); err != nil {

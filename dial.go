@@ -41,7 +41,9 @@ type Dialer struct {
 	// and used to authenticate the client and bind its identity to the WebRTC peer
 	// connection.
 	//
-	// When set to nil, no identity assertion is included in the offer.
+	// When set to nil, no identity assertion is included in the offer. Over LAN
+	// discovery the offer is never signed: an assertion alone would overflow the
+	// one datagram a signal must fit in.
 	Identity *Identity
 	// VerifyServerIdentity verifies the token contained in a server's identity
 	// assertion and returns the public key populated in its 'cpk' claim.
@@ -62,9 +64,9 @@ type Dialer struct {
 	// 'a=identity' attribute.
 	//
 	// When set to false, the server must present a valid identity assertion, except
-	// over signaling with a length limit such as LAN discovery: there a Dialer without
-	// VerifyServerIdentity also accepts an answer that has none, as vanilla LAN hosts
-	// send. An assertion that is present is always verified.
+	// over LAN discovery: there a Dialer without VerifyServerIdentity also accepts an
+	// answer that has none, as vanilla LAN hosts send. An assertion that is present
+	// is always verified.
 	// When set to true, unauthenticated servers are allowed to establish connections.
 	//
 	// This may be useful when connecting to legacy or custom implementations.
@@ -148,8 +150,9 @@ func (d Dialer) DialContext(ctx context.Context, networkID string, signaling Sig
 	if d.Log == nil {
 		d.Log = slog.Default()
 	}
+	lan := overLAN(signaling)
 	// Only a dialer that verifies no server may take the anonymous answer a LAN host sends.
-	acceptsAnonymousAnswer := d.AllowIdentitylessServer || (d.VerifyServerIdentity == nil && answersAnonymously(signaling))
+	acceptsAnonymousAnswer := d.AllowIdentitylessServer || (d.VerifyServerIdentity == nil && lan)
 	if d.VerifyServerIdentity == nil {
 		d.VerifyServerIdentity = func(ctx context.Context, identity *RemoteIdentity) (*ecdsa.PublicKey, error) {
 			publicKey, err := identity.PublicKey(true)
@@ -197,7 +200,7 @@ func (d Dialer) DialContext(ctx context.Context, networkID string, signaling Sig
 			_ = c.close(fmt.Errorf("dial failure: %w", err))
 		}
 	}()
-	if d.Identity != nil {
+	if d.Identity != nil && !lan {
 		c.description.Identity, err = d.Identity.Sign(c.description)
 		if err != nil {
 			return nil, fmt.Errorf("generate identity assertion: %w", err)
@@ -222,9 +225,12 @@ func (d Dialer) DialContext(ctx context.Context, networkID string, signaling Sig
 		}
 	}
 
-	// Encode an offer using the local parameters!
-	offer, err := c.description.Encode()
-	if err != nil {
+	offer := &Signal{
+		Type:         SignalTypeOffer,
+		ConnectionID: d.ConnectionID,
+		NetworkID:    networkID,
+	}
+	if err := fitSignal(d.Log, c.description, nil, offer, maxSignalLength(signaling)); err != nil {
 		return nil, fmt.Errorf("encode offer: %w", err)
 	}
 	// Like vanilla, the answer must arrive within the negotiation timeout of setting the offer.
@@ -234,12 +240,7 @@ func (d Dialer) DialContext(ctx context.Context, networkID string, signaling Sig
 	}
 	answerCtx, cancelAnswer := context.WithTimeoutCause(ctx, timeout, ErrNoAnswer)
 	defer cancelAnswer()
-	if err := signaling.Signal(answerCtx, &Signal{
-		Type:         SignalTypeOffer,
-		Data:         string(offer),
-		ConnectionID: d.ConnectionID,
-		NetworkID:    networkID,
-	}); err != nil {
+	if err := signaling.Signal(answerCtx, offer); err != nil {
 		if errors.Is(context.Cause(answerCtx), ErrNoAnswer) {
 			err = ErrNoAnswer
 		}
