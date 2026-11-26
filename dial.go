@@ -61,7 +61,10 @@ type Dialer struct {
 	// AllowIdentitylessServer specifies whether to allow answer SDPs without an
 	// 'a=identity' attribute.
 	//
-	// When set to false, the server must present a valid identity assertion.
+	// When set to false, the server must present a valid identity assertion, except
+	// over signaling with a length limit such as LAN discovery, where hosts answer
+	// without one, as vanilla LAN hosts do: there only a Dialer with
+	// VerifyServerIdentity set requires it.
 	// When set to true, unauthenticated servers are allowed to establish connections.
 	//
 	// This may be useful when connecting to legacy or custom implementations.
