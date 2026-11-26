@@ -114,10 +114,11 @@ func maxSignalLength(signaling Signaling) int {
 	return 0
 }
 
-// answersAnonymously reports whether an offer is answered without an identity assertion: an anonymous
-// offer over Signaling with a length limit, which an assertion alone would exceed.
-func answersAnonymously(offerHasIdentity bool, signaling Signaling) bool {
-	return !offerHasIdentity && maxSignalLength(signaling) > 0
+// answersAnonymously reports whether a host answers without an identity assertion over the Signaling:
+// one with a length limit, such as LAN discovery, where vanilla hosts never sign their answers and an
+// assertion alone would exceed the limit.
+func answersAnonymously(signaling Signaling) bool {
+	return maxSignalLength(signaling) > 0
 }
 
 const (

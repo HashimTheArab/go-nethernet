@@ -530,7 +530,7 @@ func (n *listenerNegotiator) handleOffer(signal *Signal) error {
 		return wrapSignalError(errors.New("nethernet: anonymous identity not allowed"), ErrorCodeIdentityNotAllowed)
 	}
 	limit := maxSignalLength(n.signaling)
-	if !answersAnonymously(desc.Identity != nil, n.signaling) {
+	if !answersAnonymously(n.signaling) {
 		identity, err := n.conf.IssueServerIdentity(ctx)
 		if err != nil {
 			return wrapSignalError(fmt.Errorf("issue server identity: %w", err), ErrorCodeFailedToCreateIdentityAssertion)

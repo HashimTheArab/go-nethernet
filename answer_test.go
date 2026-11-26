@@ -78,10 +78,12 @@ func TestListenerAnswerIdentity(t *testing.T) {
 	for _, tc := range []struct {
 		name         string
 		limit        int
+		signedOffer  bool
 		wantIdentity bool
 	}{
 		{name: "unlimited signaling", limit: 0, wantIdentity: true},
 		{name: "length-limited signaling", limit: 1140, wantIdentity: false},
+		{name: "a signed offer over length-limited signaling", limit: 1140, signedOffer: true, wantIdentity: false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			client, server := newMemorySignalingPair("client", "server")
@@ -89,7 +91,11 @@ func TestListenerAnswerIdentity(t *testing.T) {
 			t.Cleanup(server.close)
 			recorded := &answerRecordingSignaling{memorySignaling: server, limit: tc.limit}
 
-			_, clientConn, serverConn := dialAcceptedListener(t, &answerRecordingSignaling{memorySignaling: client, limit: tc.limit}, recorded)
+			var dialer Dialer
+			if tc.signedOffer {
+				dialer.Identity = newTestClientIdentity(t)
+			}
+			_, clientConn, serverConn := dialAcceptedListenerWith(t, dialer, &answerRecordingSignaling{memorySignaling: client, limit: tc.limit}, recorded)
 			checkConnPayload(t, clientConn, serverConn, []byte("answered"))
 
 			answer := recorded.answer()
@@ -158,6 +164,16 @@ func (s *answerRecordingSignaling) answer() string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.data
+}
+
+func newTestClientIdentity(t *testing.T) *Identity {
+	t.Helper()
+	privateKey := newIdentityTestKey(t)
+	token, err := newIdentityTestToken(privateKey, time.Now().Add(30*time.Second))
+	if err != nil {
+		t.Fatalf("sign client token: %v", err)
+	}
+	return &Identity{PrivateKey: privateKey, Token: token}
 }
 
 func testHostCandidate(address string) webrtc.ICECandidate {

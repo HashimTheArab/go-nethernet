@@ -146,7 +146,7 @@ func (d Dialer) DialContext(ctx context.Context, networkID string, signaling Sig
 		d.Log = slog.Default()
 	}
 	// Only a dialer that verifies no server may take the anonymous answer a LAN host sends.
-	acceptsAnonymousAnswer := d.AllowIdentitylessServer || (d.VerifyServerIdentity == nil && answersAnonymously(d.Identity != nil, signaling))
+	acceptsAnonymousAnswer := d.AllowIdentitylessServer || (d.VerifyServerIdentity == nil && answersAnonymously(signaling))
 	if d.VerifyServerIdentity == nil {
 		d.VerifyServerIdentity = func(ctx context.Context, identity *RemoteIdentity) (*ecdsa.PublicKey, error) {
 			publicKey, err := identity.PublicKey(true)
