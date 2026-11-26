@@ -429,9 +429,9 @@ func (conn *Conn) Abort() error {
 }
 
 // ErrICEConnectFailed is matched by a Conn's close cause, an [ICEConnectError], when its ICE
-// transport gives up finding a working path: the remote network was unreachable over WebRTC, so a dial returns it and a caller
-// may fall back to another transport. A remote rejection, a transport failure after ICE connected,
-// or a local close is not a reachability failure and does not carry it.
+// transport gives up finding a working path: the remote network was unreachable over WebRTC, so a
+// dial returns it and a caller may fall back to another transport. A remote rejection, a transport
+// failure after ICE connected, or a local close is not a reachability failure and does not carry it.
 var ErrICEConnectFailed = errors.New("nethernet: ICE transport failed to connect to the remote network")
 
 // ErrClosedByPeer is matched by a Conn's close cause when the connection ended before ICE failed:
