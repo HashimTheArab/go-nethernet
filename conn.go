@@ -465,7 +465,7 @@ func (e *ICEConnectError) Is(target error) bool {
 // is safe to log.
 type CandidateSummary struct {
 	// HostIPv4 and HostIPv6 count host candidates with an IP address, and HostMDNS those that hide
-	// it behind an mDNS (.local) name.
+	// it behind a name, normally an mDNS (.local) one.
 	HostIPv4, HostIPv6, HostMDNS int
 	// ServerReflexive counts the public addresses a STUN server saw.
 	ServerReflexive int
@@ -487,13 +487,14 @@ func summarizeCandidates(candidates []webrtc.ICECandidate) CandidateSummary {
 func (s *CandidateSummary) add(c webrtc.ICECandidate) {
 	switch c.Typ {
 	case webrtc.ICECandidateTypeHost:
+		ip, err := netip.ParseAddr(c.Address)
 		switch {
-		case strings.HasSuffix(c.Address, ".local"):
+		case err != nil:
 			s.HostMDNS++
-		case strings.Contains(c.Address, ":"):
-			s.HostIPv6++
-		default:
+		case ip.Unmap().Is4():
 			s.HostIPv4++
+		default:
+			s.HostIPv6++
 		}
 	case webrtc.ICECandidateTypeSrflx:
 		s.ServerReflexive++
@@ -636,7 +637,7 @@ func (conn *Conn) handleTransports() {
 		var cause error
 		switch {
 		case state == webrtc.ICETransportStateFailed && !conn.iceConnected.Load():
-			// Build the error in the goroutine too, as it takes candidatesMu.
+			// Count the candidates off this pion-locked handler too.
 			go func() { conn.close(conn.iceConnectError()) }()
 			return
 		case state == webrtc.ICETransportStateFailed:

@@ -114,15 +114,17 @@ func TestCandidateSummary(t *testing.T) {
 		{Typ: webrtc.ICECandidateTypeHost, Address: "192.0.2.2"},
 		{Typ: webrtc.ICECandidateTypeHost, Address: "2001:db8::1"},
 		{Typ: webrtc.ICECandidateTypeHost, Address: "0b9f6d4e-3f0a-4c6e-9b1a-1e2f3a4b5c6d.local"},
+		{Typ: webrtc.ICECandidateTypeHost, Address: "::ffff:192.0.2.3"},
+		{Typ: webrtc.ICECandidateTypeHost, Address: "redacted-ip.invalid"},
 		{Typ: webrtc.ICECandidateTypeSrflx, Address: "198.51.100.1"},
 		{Typ: webrtc.ICECandidateTypePrflx, Address: "198.51.100.2"},
 		{Typ: webrtc.ICECandidateTypeRelay, Address: "203.0.113.1"},
 	})
-	want := CandidateSummary{HostIPv4: 2, HostIPv6: 1, HostMDNS: 1, ServerReflexive: 1, Relay: 1}
+	want := CandidateSummary{HostIPv4: 3, HostIPv6: 1, HostMDNS: 2, ServerReflexive: 1, Relay: 1}
 	if got != want {
 		t.Fatalf("summarizeCandidates() = %+v, want %+v", got, want)
 	}
-	if s := got.String(); s != "host4=2 host6=1 mdns=1 srflx=1 relay=1" {
+	if s := got.String(); s != "host4=3 host6=1 mdns=2 srflx=1 relay=1" {
 		t.Fatalf("String() = %q", s)
 	}
 	if s := (CandidateSummary{ServerReflexive: 1}).String(); s != "srflx=1" {
