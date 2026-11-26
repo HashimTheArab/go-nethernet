@@ -9,6 +9,10 @@ import (
 	"io"
 )
 
+// maxDatagramSize is one unfragmented UDP payload at IPv6's 1280-byte minimum MTU. Xbox consoles lose a
+// LAN discovery datagram split into IP fragments.
+const maxDatagramSize = 1280 - 40 - 8
+
 // Packet describes a packet used in LAN discovery.
 type Packet interface {
 	// ID uniquely returns the ID of the packet. It is one of the first byte

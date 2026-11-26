@@ -445,13 +445,22 @@ func (l *Listener) handleMessage(pk *MessagePacket, senderID uint64, addr net.Ad
 
 // ServerData stores the ServerData for responding to the clients broadcasting
 // RequestPacket with a ResponsePacket containing the binary representation.
+// Names too long for the response to fit one datagram are shortened.
 func (l *Listener) ServerData(d *ServerData) {
-	b, err := d.MarshalBinary()
+	fitted := d.fitNames(maxApplicationData)
+	b, err := fitted.MarshalBinary()
 	if err != nil {
 		if l.conf.Log != nil {
 			l.conf.Log.Error("error marshaling server data", slog.Any("error", err))
 		}
 		return
+	}
+	if l.conf.Log != nil {
+		if len(b) > maxApplicationData {
+			l.conf.Log.Warn("server data exceeds one datagram and may not reach consoles", slog.Int("length", len(b)), slog.Int("limit", maxApplicationData))
+		} else if fitted != *d {
+			l.conf.Log.Debug("shortened server names to fit one datagram")
+		}
 	}
 	l.pongData.Store(&b)
 }
