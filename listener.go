@@ -15,6 +15,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unsafe"
 
 	"github.com/pion/sdp/v3"
 	"github.com/pion/webrtc/v4"
@@ -260,8 +261,8 @@ type negotiationKey struct {
 type listenerNegotiator struct {
 	key negotiationKey
 
-	// deferred holds candidates received before Conn publication, deferredBytes their signal data
-	// length, and dropped whether one was refused over budget. All are guarded by mu.
+	// deferred holds candidates received before Conn publication, deferredBytes their
+	// deferredCandidateCost, and dropped whether one was refused over budget. All are guarded by mu.
 	deferred      []webrtc.ICECandidate
 	deferredBytes int
 	dropped       bool
@@ -283,10 +284,15 @@ type listenerNegotiator struct {
 const (
 	// maxListenerNegotiations bounds offer goroutines through acceptance or failure delivery.
 	maxListenerNegotiations = 64
-	// maxDeferredCandidateBytes bounds the candidate data one offer holds before its Conn is published.
-	// Vanilla queues without limit; this holds over 200 of the longest real candidate lines.
+	// maxDeferredCandidateBytes bounds the memory one offer holds in candidates before its Conn is
+	// published. Vanilla queues without limit; this holds over 150 of the longest real candidate lines.
 	maxDeferredCandidateBytes = 64 << 10
 )
+
+// deferredCandidateCost is the memory a deferred candidate holds: its signal data and its parsed form.
+func deferredCandidateCost(data string) int {
+	return len(data) + int(unsafe.Sizeof(webrtc.ICECandidate{}))
+}
 
 // handleSignal handles the given Signal received from the remote network.
 // Candidates are deferred until the offer publishes its Conn.
@@ -346,7 +352,8 @@ func (n *listenerNegotiator) handleSignal(signal *Signal) bool {
 			return true
 		}
 
-		if n.deferredBytes+len(signal.Data) > maxDeferredCandidateBytes {
+		cost := deferredCandidateCost(signal.Data)
+		if n.deferredBytes+cost > maxDeferredCandidateBytes {
 			logDrop := !n.dropped
 			n.dropped = true
 			n.mu.Unlock()
@@ -356,7 +363,7 @@ func (n *listenerNegotiator) handleSignal(signal *Signal) bool {
 			return false
 		}
 		n.deferred = append(n.deferred, candidate)
-		n.deferredBytes += len(signal.Data)
+		n.deferredBytes += cost
 		n.mu.Unlock()
 		return true
 	default:

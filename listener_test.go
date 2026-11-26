@@ -316,7 +316,11 @@ func TestListenerProcessesConnectionsIndependently(t *testing.T) {
 
 	// Keep the first connection blocked and fill only its queue. The second
 	// connection continues independently.
-	fill := maxDeferredCandidateBytes / len(fillerCandidate)
+	// A malformed candidate is refused on arrival, without using budget.
+	if l.NotifySignal(&Signal{Type: SignalTypeCandidate, ConnectionID: 1, NetworkID: "remote", Data: "candidate"}) {
+		t.Fatal("NotifySignal(malformed candidate) = true, want false")
+	}
+	fill := maxDeferredCandidateBytes / deferredCandidateCost(fillerCandidate)
 	accepted := make(chan bool, fill)
 	for range fill {
 		go func() {
@@ -340,10 +344,6 @@ func TestListenerProcessesConnectionsIndependently(t *testing.T) {
 		Data:         fillerCandidate,
 	}) {
 		t.Fatal("NotifySignal(over capacity) = true, want false")
-	}
-	// A malformed candidate is refused on arrival.
-	if l.NotifySignal(&Signal{Type: SignalTypeCandidate, ConnectionID: 2, NetworkID: "remote", Data: "candidate"}) {
-		t.Fatal("NotifySignal(malformed candidate) = true, want false")
 	}
 }
 
@@ -489,7 +489,7 @@ func TestListenerRemoteCancellationReleasesPendingOffers(t *testing.T) {
 	}
 	waitListenerState(t, l, maxListenerNegotiations, maxListenerNegotiations)
 	// Cancellation must work even when the candidate queue is already full.
-	for range maxDeferredCandidateBytes / len(fillerCandidate) {
+	for range maxDeferredCandidateBytes / deferredCandidateCost(fillerCandidate) {
 		if !l.NotifySignal(&Signal{Type: SignalTypeCandidate, NetworkID: "remote", ConnectionID: 0, Data: fillerCandidate}) {
 			t.Fatal("candidate rejected before deferred capacity")
 		}
@@ -759,7 +759,7 @@ func TestDefaultAPIsAdvertiseVanillaReceiveWindow(t *testing.T) {
 	}
 }
 
-func TestListenerIgnoresMalformedDeferredSignals(t *testing.T) {
+func TestListenerIgnoresMalformedEarlySignals(t *testing.T) {
 	for _, kind := range []string{SignalTypeCandidate, SignalTypeError} {
 		t.Run(kind, func(t *testing.T) {
 			client, server := newMemorySignalingPair("client", "server")
