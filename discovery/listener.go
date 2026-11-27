@@ -474,6 +474,7 @@ func (l *Listener) PongData(b []byte) {
 		l.conf.Log.Error("unexpected pong data format", slog.String("data", string(b)))
 		return
 	}
+	protocol, _ := strconv.Atoi(parts[2])
 	players, _ := strconv.Atoi(parts[4])
 	maxPlayers, _ := strconv.Atoi(parts[5])
 	gameType, ok := parsePongGameType(parts[8])
@@ -483,6 +484,8 @@ func (l *Listener) PongData(b []byte) {
 
 	d := &ServerData{
 		ServerName:            parts[1],
+		Protocol:              int32(protocol),
+		Version:               parts[3],
 		LevelName:             parts[7],
 		GameType:              gameType,
 		PlayerCount:           int32(players),

@@ -330,7 +330,8 @@ func (n *listenerNegotiator) handleSignal(signal *Signal) bool {
 		// Parsing first gives every deferred candidate a minimum cost, so the byte budget also bounds their count.
 		candidate, err := parseRemoteCandidate(signal.Data)
 		if err != nil {
-			n.log().Error("error parsing candidate", "error", err)
+			// Debug, since an unauthenticated LAN peer could otherwise flood the log with junk candidates.
+			n.log().Debug("error parsing candidate", "error", err)
 			return false
 		}
 		n.mu.Lock()
