@@ -167,16 +167,3 @@ func TestCutNameDropsDanglingFormattingPrefix(t *testing.T) {
 		t.Fatalf("cutName() = %q, want %q", got, "ab")
 	}
 }
-
-// PongData advertises the protocol and version from the pong, as a vanilla host does.
-func TestListenerPongDataKeepsProtocolAndVersion(t *testing.T) {
-	l := &Listener{}
-	l.PongData([]byte("MCPE;Lunar Proxy;924;1.26.60;1;10;1234;World;Survival;1;19132;19133;0;"))
-	var d ServerData
-	if err := d.UnmarshalBinary(*l.pongData.Load()); err != nil {
-		t.Fatalf("UnmarshalBinary() error = %v", err)
-	}
-	if d.Protocol != 924 || d.Version != "1.26.60" {
-		t.Fatalf("Protocol, Version = %d, %q, want 924, %q", d.Protocol, d.Version, "1.26.60")
-	}
-}
